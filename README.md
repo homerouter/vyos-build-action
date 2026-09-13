@@ -3,7 +3,7 @@
 Builds the current [`vyos/vyos-build@rolling`](https://github.com/vyos/vyos-build/tree/rolling)
 ISO with:
 
-- the latest matching kernel release from
+- the matching kernel, Intel QAT, and firmware release from
   [`homerouter/vyos-kernel-rolling`](https://github.com/homerouter/vyos-kernel-rolling);
 - `libnftnl` 1.3.2-1 from
   [`homerouter/libnftnl-fullcone`](https://github.com/homerouter/libnftnl-fullcone/releases/tag/1.3.2-1);

@@ -1,39 +1,18 @@
-# VyOS ISO Automation Build
+# VyOS rolling Fullcone ISO
 
-Automate build VyOS v1.2 LTS, v1.3 LTS Release, v1.4 LTS Release and v1.5 Rolling Release ISO files.
+Builds the current [`vyos/vyos-build@rolling`](https://github.com/vyos/vyos-build/tree/rolling)
+ISO with:
 
-## About this repository
+- the latest matching kernel release from
+  [`homerouter/vyos-kernel-rolling`](https://github.com/homerouter/vyos-kernel-rolling);
+- `libnftnl` 1.3.2-1 from
+  [`homerouter/libnftnl-fullcone`](https://github.com/homerouter/libnftnl-fullcone/releases/tag/1.3.2-1);
+- `nftables` 1.1.7-1 from
+  [`homerouter/nftables-fullcone`](https://github.com/homerouter/nftables-fullcone/releases/tag/1.1.7-1).
 
-Use the official build script provided by VyOS [https://github.com/vyos/vyos-build](https://github.com/vyos/vyos-build).
+The workflow verifies checksums, confirms the exact packages and Fullcone
+kernel module are inside the ISO, uploads an Actions artifact, and publishes a
+prerelease.
 
-Manual build VyOS instructions can be found in VyOS official [Documentation - Build VyOS](https://docs.vyos.io/en/latest/contributing/build-vyos.html).
-
-## Github Action workflow files
-
-Github Action automate the build process and save you some times.
-
-There are two workflow files:
-
-[vyos-v1.2.x-crux.yml](.github/workflows/vyos-v1.2.x-crux.yml)
-
-For VyOS v1.2.x LTS release, action trigger by a tag push. It will build the ISO and VM image files, create a release and upload the release asset.
-
-[vyos-v1.3.x-equuleus.yml](.github/workflows/vyos-v1.3.x-equuleus.yml)
-
-For VyOS v1.3.x LTS release, action trigger by a tag push. It will build the ISO and VM image files, create a release and upload the release asset.
-
-[vyos-v1.4.x-sagitta.yml](.github/workflows/vyos-v1.4.x-sagitta.yml)
-
-For VyOS v1.4.x LTS release, action trigger by a tag push. It will build the ISO and VM image files, create a release and upload the release asset.
-
-[vyos-v1.5-rolling-release.yml](.github/workflows/vyos-v1.5-rolling-release.yml)
-
-For VyOs v1.5 rolling release, action trigger on schedule every day. ISO file can be found in the Action Artifacts section.
-
-You can edit the workflow files to modify the trigger conditions to suit your needs.
-
-## Generate your own private key for signing vmware image
-
-```bash
-openssl req -x509 -nodes -sha256 -newkey rsa:2048 -keyout private_key_for_signing_vmware_image.pem -out private_key_for_signing_vmware_image.pem
-```
+Build the kernel repository first, then run **Build VyOS rolling Fullcone ISO**
+from the Actions tab. No repository secrets are required.

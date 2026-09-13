@@ -2,9 +2,6 @@ name: Build VyOS rolling Fullcone ISO
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - .github/workflows/build-iso.yml
 
 permissions:
   contents: write

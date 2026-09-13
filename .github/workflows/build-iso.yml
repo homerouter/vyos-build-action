@@ -175,7 +175,7 @@ jobs:
         run: |
           gh release create "v$VERSION" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --target "${{ github.event.repository.default_branch }}" \
             --title "VyOS $VERSION" \
             --notes "VyOS source: ${{ needs.build.outputs.vyos_sha }}
           Fullcone kernel: ${{ needs.build.outputs.kernel_tag }}

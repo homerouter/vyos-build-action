@@ -173,7 +173,7 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         shell: bash
         run: |
-          gh release create "v$VERSION" release/* \
+          gh release create "v$VERSION" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "VyOS $VERSION" \
@@ -183,4 +183,7 @@ jobs:
           Firmware: ${{ needs.build.outputs.firmware_version }}
           libnftnl: 1.3.2-1
           nftables: 1.1.7-1" \
-            --prerelease
+            --draft
+          gh release upload "v$VERSION" release/* --repo "$GITHUB_REPOSITORY"
+          gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --prerelease

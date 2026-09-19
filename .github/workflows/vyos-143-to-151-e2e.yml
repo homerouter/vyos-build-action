@@ -85,24 +85,31 @@ jobs:
             exit 1
           }
 
-          for {set n 0} {$n < 30} {incr n} {
+          proc login_vyos {} {
+            set timeout 180
             send -- "\r"
             expect {
-              -re {(?i)vyos login:} {
-                send -- "vyos\r"
-                expect -re {(?i)password:}
-                send -- "vyos\r"
-                break
-              }
-              -re {vyos@vyos.*[$#] ?$} { break }
-              timeout {}
+              -re {(?i)vyos login:\s*$} { send -- "vyos\r" }
+              -re {vyos@vyos.*[$#]\s*$} { return }
+              timeout { die "live login prompt not reached" }
+              eof { die "serial console closed before live login" }
+            }
+            expect {
+              -re {(?i)password:\s*$} { send -- "vyos\r" }
+              -re {vyos@vyos.*[$#]\s*$} { return }
+              timeout { die "live password prompt not reached" }
+              eof { die "serial console closed at live password prompt" }
+            }
+            expect {
+              -re {vyos@vyos.*[$#]\s*$} { return }
+              -re {(?i)login incorrect} { die "VyOS rejected live vyos/vyos credentials" }
+              -re {(?i)login timed out} { die "VyOS live login timed out after password submission" }
+              timeout { die "live shell not reached after password" }
+              eof { die "serial console closed before live shell" }
             }
           }
 
-          expect {
-            -re {vyos@vyos.*[$#] ?$} {}
-            timeout { die "live shell not reached" }
-          }
+          login_vyos
 
           send -- "show version\r"
           expect {
@@ -232,20 +239,31 @@ jobs:
             exit 1
           }
 
-          send -- "\r"
-          expect {
-            -re {(?i)vyos login:} {
-              send -- "vyos\r"
-              expect -re {(?i)password:}
-              send -- "vyos\r"
+          proc login_vyos {} {
+            set timeout 240
+            send -- "\r"
+            expect {
+              -re {(?i)vyos login:\s*$} { send -- "vyos\r" }
+              -re {vyos@.*[$#]\s*$} { return }
+              timeout { die "installed 1.4.3 login prompt not reached" }
+              eof { die "serial console closed before installed 1.4.3 login" }
             }
-            timeout { die "installed 1.4.3 login not reached" }
+            expect {
+              -re {(?i)password:\s*$} { send -- "vyos\r" }
+              -re {vyos@.*[$#]\s*$} { return }
+              timeout { die "installed 1.4.3 password prompt not reached" }
+              eof { die "serial console closed at installed 1.4.3 password prompt" }
+            }
+            expect {
+              -re {vyos@.*[$#]\s*$} { return }
+              -re {(?i)login incorrect} { die "VyOS rejected installed 1.4.3 credentials" }
+              -re {(?i)login timed out} { die "installed 1.4.3 login timed out after password submission" }
+              timeout { die "installed 1.4.3 shell not reached after password" }
+              eof { die "serial console closed before installed 1.4.3 shell" }
+            }
           }
 
-          expect {
-            -re {vyos@.*[$#] ?$} {}
-            timeout { die "installed 1.4.3 shell not reached" }
-          }
+          login_vyos
 
           send -- "show version\r"
           expect {
@@ -331,28 +349,31 @@ jobs:
             exit 1
           }
 
-          set logged 0
-          for {set n 0} {$n < 30 && !$logged} {incr n} {
+          proc login_vyos {} {
+            set timeout 420
             send -- "\r"
             expect {
-              -re {(?i)vyos login:} {
-                send -- "vyos\r"
-                expect -re {(?i)password:}
-                send -- "vyos\r"
-                set logged 1
-              }
-              timeout {}
+              -re {(?i)vyos login:\s*$} { send -- "vyos\r" }
+              -re {vyos@.*[$#]\s*$} { return }
+              timeout { die "VyOS 1.5.1 login prompt not reached after reboot" }
+              eof { die "serial console closed before VyOS 1.5.1 login" }
+            }
+            expect {
+              -re {(?i)password:\s*$} { send -- "vyos\r" }
+              -re {vyos@.*[$#]\s*$} { return }
+              timeout { die "VyOS 1.5.1 password prompt not reached" }
+              eof { die "serial console closed at VyOS 1.5.1 password prompt" }
+            }
+            expect {
+              -re {vyos@.*[$#]\s*$} { return }
+              -re {(?i)login incorrect} { die "VyOS rejected 1.5.1 vyos/vyos credentials" }
+              -re {(?i)login timed out} { die "VyOS 1.5.1 login timed out after password submission" }
+              timeout { die "VyOS 1.5.1 shell not reached after password" }
+              eof { die "serial console closed before VyOS 1.5.1 shell" }
             }
           }
 
-          if {!$logged} {
-            die "VyOS login prompt not reached after upgrade reboot"
-          }
-
-          expect {
-            -re {vyos@.*[$#] ?$} {}
-            timeout { die "VyOS shell not reached after upgrade reboot" }
-          }
+          login_vyos
 
           send -- "show version\r"
           expect {

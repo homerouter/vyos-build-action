@@ -1,0 +1,670 @@
+name: VyOS 1.4.3 -> 1.5.1 Real E2E
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vyos-143-to-151-real-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: vyos-test-images
+
+  VYOS_143_ISO: vyos-1.4.3-generic-amd64.iso
+  VYOS_151_ISO: vyos-1.5.1-generic-amd64.iso
+
+  VM_DISK: vyos-e2e.qcow2
+
+jobs:
+  e2e:
+    name: VyOS 1.4.3 -> 1.5.1 real upgrade
+    runs-on: ubuntu-24.04
+
+    timeout-minutes: 60
+
+    steps:
+      # ============================================================
+      # Checkout
+      # ============================================================
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # Host dependencies
+      # ============================================================
+
+      - name: Install host dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            expect \
+            socat \
+            curl \
+            jq \
+            file
+
+          qemu-system-x86_64 --version
+          qemu-img --version
+          expect -v
+          socat -V | head -20
+
+      # ============================================================
+      # Download cached ISO images from GitHub Release
+      #
+      # Release:
+      # https://github.com/homerouter/vyos-build-action/releases/tag/vyos-test-images
+      # ============================================================
+
+      - name: Download VyOS test images from release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+
+          mkdir -p images logs
+
+          gh release download "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${VYOS_143_ISO}" \
+            --pattern "${VYOS_151_ISO}" \
+            --dir images \
+            --clobber
+
+          echo
+          echo "======================================================"
+          echo " Downloaded ISO images"
+          echo "======================================================"
+
+          ls -lh images/
+
+          test -s "images/${VYOS_143_ISO}"
+          test -s "images/${VYOS_151_ISO}"
+
+          echo
+          file "images/${VYOS_143_ISO}"
+          file "images/${VYOS_151_ISO}"
+
+          echo
+          echo "SHA256:"
+          sha256sum \
+            "images/${VYOS_143_ISO}" \
+            "images/${VYOS_151_ISO}"
+
+      # ============================================================
+      # Create VM disk
+      # ============================================================
+
+      - name: Create VM disk
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          qemu-img create \
+            -f qcow2 \
+            "${VM_DISK}" \
+            12G
+
+          qemu-img info "${VM_DISK}"
+
+      # ============================================================
+      # Helper scripts
+      # ============================================================
+
+      - name: Create VM helper scripts
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p scripts logs
+
+          cat > scripts/start-vm.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          MODE="${1:?usage: start-vm.sh <installer|disk>}"
+
+          rm -f vm.serial vm.monitor vm.pid
+
+          common=(
+            -name vyos-e2e
+            -machine accel=tcg
+            -cpu max
+            -smp 2
+            -m 2048
+            -drive "file=vyos-e2e.qcow2,if=virtio,format=qcow2"
+            -netdev user,id=net0
+            -device virtio-net-pci,netdev=net0
+            -display none
+            -serial unix:vm.serial,server=on,wait=off
+            -monitor unix:vm.monitor,server=on,wait=off
+            -daemonize
+            -pidfile vm.pid
+            -no-reboot
+          )
+
+          case "${MODE}" in
+            installer)
+              exec qemu-system-x86_64 \
+                "${common[@]}" \
+                -boot order=d \
+                -cdrom "images/vyos-1.4.3-generic-amd64.iso"
+              ;;
+
+            disk)
+              exec qemu-system-x86_64 \
+                "${common[@]}" \
+                -boot order=c
+              ;;
+
+            *)
+              echo "Unknown mode: ${MODE}" >&2
+              exit 2
+              ;;
+          esac
+          EOF
+
+          cat > scripts/stop-vm.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          if [[ -S vm.monitor ]]; then
+            printf 'quit\n' | \
+              socat - UNIX-CONNECT:vm.monitor || true
+          fi
+
+          if [[ -f vm.pid ]]; then
+            pid="$(cat vm.pid)"
+
+            for _ in $(seq 1 30); do
+              if ! kill -0 "${pid}" 2>/dev/null; then
+                break
+              fi
+
+              sleep 1
+            done
+
+            if kill -0 "${pid}" 2>/dev/null; then
+              kill "${pid}" || true
+              sleep 2
+            fi
+
+            if kill -0 "${pid}" 2>/dev/null; then
+              kill -9 "${pid}" || true
+            fi
+          fi
+
+          rm -f vm.serial vm.monitor vm.pid
+          EOF
+
+          chmod +x \
+            scripts/start-vm.sh \
+            scripts/stop-vm.sh
+
+      # ============================================================
+      # Boot VyOS 1.4.3 live ISO
+      # ============================================================
+
+      - name: Boot VyOS 1.4.3 live ISO
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ./scripts/start-vm.sh installer
+
+          for _ in $(seq 1 30); do
+            [[ -S vm.serial ]] && exit 0
+            sleep 1
+          done
+
+          echo "Serial socket did not appear"
+          exit 1
+
+      # ============================================================
+      # Real install image
+      # ============================================================
+
+      - name: Install VyOS 1.4.3 to VM disk
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > /tmp/install-143.exp <<'EOF'
+          set timeout 900
+
+          log_user 1
+          log_file -noappend logs/install-143-console.log
+
+          spawn socat STDIO UNIX-CONNECT:vm.serial
+
+          proc fail {msg} {
+              puts ""
+              puts "======================================================"
+              puts " FAIL"
+              puts " $msg"
+              puts "======================================================"
+              exit 1
+          }
+
+          proc enter {} {
+              send -- "\r"
+          }
+
+          # --------------------------------------------------------
+          # Wait for login
+          # --------------------------------------------------------
+
+          expect {
+              -re {vyos login: *$} {
+                  puts "\nSTATE: login prompt"
+                  send -- "vyos\r"
+              }
+
+              timeout {
+                  fail "VyOS login prompt not found"
+              }
+
+              eof {
+                  fail "serial console closed before login"
+              }
+          }
+
+          expect {
+              -re {Password: *$} {
+                  puts "\nSTATE: password prompt"
+                  send -- "vyos\r"
+              }
+
+              timeout {
+                  fail "password prompt not found"
+              }
+
+              eof {
+                  fail "serial console closed at password prompt"
+              }
+          }
+
+          expect {
+              -re {vyos@[^ ]+:[^\r\n]*[$#] *$} {
+                  puts "\nSTATE: shell ready"
+              }
+
+              timeout {
+                  fail "shell prompt not found"
+              }
+          }
+
+          # --------------------------------------------------------
+          # Confirm live version
+          # --------------------------------------------------------
+
+          send -- "show version\r"
+
+          expect {
+              -re {1\.4\.3} {
+                  puts "\nSTATE: confirmed live VyOS 1.4.3"
+              }
+
+              timeout {
+                  fail "live system did not report VyOS 1.4.3"
+              }
+          }
+
+          expect {
+              -re {vyos@[^ ]+:[^\r\n]*[$#] *$} {}
+
+              timeout {
+                  fail "shell prompt did not return after show version"
+              }
+          }
+
+          # --------------------------------------------------------
+          # Native installer
+          # --------------------------------------------------------
+
+          puts ""
+          puts "======================================================"
+          puts " Running: install image"
+          puts "======================================================"
+
+          send -- "install image\r"
+
+          set finished 0
+
+          while {!$finished} {
+              expect {
+                  # Exact prompt observed on VyOS 1.4.3
+                  -re {Would you like to continue\? *y/N *$} {
+                      puts "\nINSTALLER: continue -> y"
+                      send -- "y\r"
+                      exp_continue
+                  }
+
+                  -re {Would you like to continue\? *Y/n *$} {
+                      puts "\nINSTALLER: continue -> y"
+                      send -- "y\r"
+                      exp_continue
+                  }
+
+                  # Image name
+                  -re {What would you like to name this image.*[:?] *$} {
+                      puts "\nINSTALLER: image name -> default"
+                      enter
+                      exp_continue
+                  }
+
+                  # Generic disk selection variants
+                  -re {Which one should be used for installation.*[:?] *$} {
+                      puts "\nINSTALLER: disk -> default"
+                      enter
+                      exp_continue
+                  }
+
+                  -re {Select installation disk.*[:?] *$} {
+                      puts "\nINSTALLER: disk -> default"
+                      enter
+                      exp_continue
+                  }
+
+                  -re {Please select.*disk.*[:?] *$} {
+                      puts "\nINSTALLER: disk -> default"
+                      enter
+                      exp_continue
+                  }
+
+                  -re {What disk would you like to install to.*[:?] *$} {
+                      puts "\nINSTALLER: disk -> default"
+                      enter
+                      exp_continue
+                  }
+
+                  -re {Select installation partition.*[:?] *$} {
+                      puts "\nINSTALLER: partition -> default"
+                      enter
+                      exp_continue
+                  }
+
+                  # Partition sizing
+                  -re {How big of a root partition should I create.*[:?] *$} {
+                      puts "\nINSTALLER: root size -> default"
+                      enter
+                      exp_continue
+                  }
+
+                  -re {Enter partition size.*[:?] *$} {
+                      puts "\nINSTALLER: partition size -> default"
+                      enter
+                      exp_continue
+                  }
+
+                  # Destructive confirmations
+                  -re {This will destroy all data.*y/N *$} {
+                      puts "\nINSTALLER: erase disk -> y"
+                      send -- "y\r"
+                      exp_continue
+                  }
+
+                  -re {Continue\? *y/N *$} {
+                      puts "\nINSTALLER: continue -> y"
+                      send -- "y\r"
+                      exp_continue
+                  }
+
+                  -re {Are you sure.*y/N *$} {
+                      puts "\nINSTALLER: confirmation -> y"
+                      send -- "y\r"
+                      exp_continue
+                  }
+
+                  # Configuration
+                  -re {Would you like to keep the current configuration.*Y/n *$} {
+                      puts "\nINSTALLER: keep config -> default"
+                      enter
+                      exp_continue
+                  }
+
+                  -re {Would you like to copy.*configuration.*Y/n *$} {
+                      puts "\nINSTALLER: copy config -> default"
+                      enter
+                      exp_continue
+                  }
+
+                  # Password
+                  -re {Please enter a password.*: *$} {
+                      puts "\nINSTALLER: password -> vyos"
+                      send -- "vyos\r"
+                      exp_continue
+                  }
+
+                  -re {Enter password.*: *$} {
+                      puts "\nINSTALLER: password -> vyos"
+                      send -- "vyos\r"
+                      exp_continue
+                  }
+
+                  -re {Please confirm password.*: *$} {
+                      puts "\nINSTALLER: password confirmation -> vyos"
+                      send -- "vyos\r"
+                      exp_continue
+                  }
+
+                  -re {Retype.*password.*: *$} {
+                      puts "\nINSTALLER: password confirmation -> vyos"
+                      send -- "vyos\r"
+                      exp_continue
+                  }
+
+                  # GRUB
+                  -re {Which drive should GRUB be installed on.*[:?] *$} {
+                      puts "\nINSTALLER: GRUB disk -> default"
+                      enter
+                      exp_continue
+                  }
+
+                  -re {Install the GRUB boot loader.*Y/n *$} {
+                      puts "\nINSTALLER: GRUB -> yes"
+                      send -- "y\r"
+                      exp_continue
+                  }
+
+                  # Informational success messages
+                  -re {Installation completed successfully} {
+                      puts "\nINSTALLER: success message"
+                      exp_continue
+                  }
+
+                  -re {Installation complete} {
+                      puts "\nINSTALLER: installation complete"
+                      exp_continue
+                  }
+
+                  -re {Done!} {
+                      puts "\nINSTALLER: done"
+                      exp_continue
+                  }
+
+                  # Returned to shell
+                  -re {vyos@[^ ]+:[^\r\n]*[$#] *$} {
+                      puts ""
+                      puts "======================================================"
+                      puts " Installer returned to VyOS CLI"
+                      puts "======================================================"
+
+                      set finished 1
+                  }
+
+                  -re {No suitable disk.*} {
+                      fail "installer could not find target disk"
+                  }
+
+                  -re {Installation failed.*} {
+                      fail "installer reported failure"
+                  }
+
+                  timeout {
+                      puts ""
+                      puts "======================================================"
+                      puts " INSTALLER TIMEOUT / UNKNOWN PROMPT"
+                      puts "======================================================"
+                      puts ""
+                      puts "Inspect logs/install-143-console.log"
+                      exit 1
+                  }
+
+                  eof {
+                      fail "serial console closed during installation"
+                  }
+              }
+          }
+
+          send -- "sync\r"
+
+          expect {
+              -re {vyos@[^ ]+:[^\r\n]*[$#] *$} {}
+
+              timeout {
+                  fail "sync did not return"
+              }
+          }
+
+          puts ""
+          puts "======================================================"
+          puts " PASS: VyOS 1.4.3 installation completed"
+          puts "======================================================"
+
+          exit 0
+          EOF
+
+          expect /tmp/install-143.exp
+
+      # ============================================================
+      # Stop live VM
+      # ============================================================
+
+      - name: Stop VyOS 1.4.3 live VM
+        if: always()
+        shell: bash
+        run: |
+          ./scripts/stop-vm.sh || true
+
+      # ============================================================
+      # Inspect installed disk
+      # ============================================================
+
+      - name: Inspect installed VM disk
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          qemu-img check "${VM_DISK}"
+          qemu-img info "${VM_DISK}"
+
+      # ============================================================
+      # Boot installed VyOS 1.4.3
+      # ============================================================
+
+      - name: Boot installed VyOS 1.4.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ./scripts/start-vm.sh disk
+
+          for _ in $(seq 1 30); do
+            [[ -S vm.serial ]] && exit 0
+            sleep 1
+          done
+
+          exit 1
+
+      # ============================================================
+      # Confirm installed version
+      # ============================================================
+
+      - name: Verify installed VyOS 1.4.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > /tmp/verify-143.exp <<'EOF'
+          set timeout 300
+
+          log_user 1
+          log_file -noappend logs/boot-installed-143.log
+
+          spawn socat STDIO UNIX-CONNECT:vm.serial
+
+          expect {
+              -re {vyos login: *$} {
+                  send -- "vyos\r"
+              }
+
+              timeout {
+                  puts "FAIL: installed VyOS login prompt not found"
+                  exit 1
+              }
+          }
+
+          expect {
+              -re {Password: *$} {
+                  send -- "vyos\r"
+              }
+
+              timeout {
+                  puts "FAIL: password prompt not found"
+                  exit 1
+              }
+          }
+
+          expect {
+              -re {vyos@[^ ]+:[^\r\n]*[$#] *$} {}
+
+              timeout {
+                  puts "FAIL: shell prompt not found"
+                  exit 1
+              }
+          }
+
+          send -- "show version\r"
+
+          expect {
+              -re {1\.4\.3} {
+                  puts ""
+                  puts "PASS: installed system is VyOS 1.4.3"
+              }
+
+              timeout {
+                  puts "FAIL: installed system did not report 1.4.3"
+                  exit 1
+              }
+          }
+
+          expect {
+              -re {vyos@[^ ]+:[^\r\n]*[$#] *$} {}
+              timeout { exit 1 }
+          }
+
+          exit 0
+          EOF
+
+          expect /tmp/verify-143.exp
+
+      # ============================================================
+      # Serve 1.5.1 ISO from GitHub runner to guest
+      #
+      # QEMU user networking:
+      #
+      # guest -> 10.0.2.2 = host
+      # ============================================================
+
+      - name: Start local HTTP server for VyOS 1.5

@@ -1,0 +1,309 @@
+name: VyOS 1.4.3 -> 1.5.1 real VM E2E
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: vyos-test-images
+  ISO_143: vyos-1.4.3-generic-amd64.iso
+  ISO_151: vyos-1.5.1-generic-amd64.iso
+  DISK: vyos-e2e.qcow2
+  SERIAL: serial.sock
+  QEMU_LOG: qemu.log
+  QEMU_PID: qemu.pid
+
+jobs:
+  e2e:
+    name: VyOS 1.4.3 -> 1.5.1 real VM E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils socat expect curl file
+
+      - name: Download release ISOs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+          curl -fL --retry 5 --retry-delay 2 -o "$ISO_143" "$base/$ISO_143"
+          curl -fL --retry 5 --retry-delay 2 -o "$ISO_151" "$base/$ISO_151"
+          test -s "$ISO_143"
+          test -s "$ISO_151"
+          file "$ISO_143" "$ISO_151"
+          sha256sum "$ISO_143" "$ISO_151" | tee iso-sha256.txt
+
+      - name: Create disk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          qemu-img create -f qcow2 "$DISK" 8G
+          qemu-img info "$DISK"
+
+      - name: Create VM helpers
+        shell: bash
+        run: |
+          cat > qemu-helper.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          stop_vm() {
+            if [[ -f "$QEMU_PID" ]]; then
+              pid="$(cat "$QEMU_PID" 2>/dev/null || true)"
+              if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+                for _ in $(seq 1 15); do
+                  kill -0 "$pid" 2>/dev/null || break
+                  sleep 1
+                done
+                kill -9 "$pid" 2>/dev/null || true
+              fi
+            fi
+            rm -f "$QEMU_PID" "$SERIAL"
+          }
+
+          start_vm() {
+            local iso="${1:-}"
+            local boot="${2:-c}"
+            stop_vm || true
+            rm -f "$SERIAL"
+            : > "$QEMU_LOG"
+
+            args=(
+              -machine accel=kvm:tcg
+              -cpu max
+              -m 2048
+              -smp 2
+              -drive "file=$DISK,if=virtio,format=qcow2"
+              -boot "$boot"
+              -display none
+              -serial "unix:$SERIAL,server=on,wait=off"
+              -monitor none
+              -no-reboot
+              -netdev user,id=n0
+              -device e1000,netdev=n0
+            )
+            [[ -z "$iso" ]] || args+=( -cdrom "$iso" )
+
+            qemu-system-x86_64 "${args[@]}" >>"$QEMU_LOG" 2>&1 &
+            echo $! > "$QEMU_PID"
+
+            for _ in $(seq 1 30); do
+              [[ -S "$SERIAL" ]] && return 0
+              kill -0 "$(cat "$QEMU_PID")" 2>/dev/null || {
+                cat "$QEMU_LOG" >&2 || true
+                return 1
+              }
+              sleep 1
+            done
+            echo "serial socket unavailable" >&2
+            return 1
+          }
+
+          case "${1:-}" in
+            start) start_vm "${2:-}" "${3:-c}" ;;
+            stop) stop_vm ;;
+            *) echo "usage: $0 {start [iso] [boot]|stop}" >&2; exit 2 ;;
+          esac
+          SH
+          chmod +x qemu-helper.sh
+
+          cat > console.exp <<'EXP'
+          #!/usr/bin/expect -f
+          set timeout 420
+          log_user 1
+          set mode [lindex $argv 0]
+          spawn socat - "UNIX-CONNECT:$env(SERIAL)"
+
+          proc login_vyos {} {
+            set timeout 420
+            expect {
+              -re {([Vv]yOS|vyos) login: *$} { send -- "vyos\r" }
+              timeout { puts stderr "ERROR: login prompt not reached"; exit 10 }
+              eof { puts stderr "ERROR: console closed before login"; exit 11 }
+            }
+            expect {
+              -re {Password: *$} { send -- "vyos\r" }
+              timeout { puts stderr "ERROR: password prompt not reached"; exit 12 }
+            }
+            expect {
+              -re {vyos@[^:\r\n]+:[^\r\n]*[$#] *$} {}
+              timeout { puts stderr "ERROR: shell prompt not reached"; exit 13 }
+            }
+          }
+
+          proc run_cmd {s marker t} {
+            set timeout $t
+            send -- "$s; rc=\$?; echo $marker:\$rc\r"
+            expect {
+              -re "$marker:0\r?\n" {}
+              -re "$marker:([1-9][0-9]*)\r?\n" {
+                puts stderr "ERROR: command failed: $s"; exit 20
+              }
+              timeout { puts stderr "ERROR: command timeout: $s"; exit 21 }
+              eof { puts stderr "ERROR: console closed"; exit 22 }
+            }
+          }
+
+          if {$mode eq "install143"} {
+            login_vyos
+            send -- "install image\r"
+            set timeout 1200
+            set done 0
+            while {!$done} {
+              expect {
+                -re {Would you like to continue\? \[y/N\]} { send -- "y\r" }
+                -re {Do you want to continue\? \[y/N\]} { send -- "y\r" }
+                -re {What would you like to name this image\?.*} { send -- "\r" }
+                -re {Select installation type:.*} { send -- "\r" }
+                -re {Which one should be used for installation\?.*} { send -- "\r" }
+                -re {Would you like to use all the free space on the drive\?.*} { send -- "y\r" }
+                -re {How big of a root partition should I create\?.*} { send -- "\r" }
+                -re {What console should be used by default\?.*} { send -- "\r" }
+                -re {Please enter a password for the "vyos" user:.*} { send -- "vyos\r" }
+                -re {Please confirm password for the "vyos" user:.*} { send -- "vyos\r" }
+                -re {Which drive should GRUB modify.*} { send -- "\r" }
+                -re {Installation complete|installation completed|installed successfully} { set done 1 }
+                -re {vyos@[^:\r\n]+:[^\r\n]*[$#] *$} { set done 1 }
+                timeout { puts stderr "ERROR: timeout installing 1.4.3"; exit 30 }
+                eof { puts stderr "ERROR: console closed installing 1.4.3"; exit 31 }
+              }
+            }
+            send -- "sync\r"
+            after 2000
+            send -- "sudo poweroff\r"
+            expect eof
+            exit 0
+          }
+
+          if {$mode eq "verify143"} {
+            login_vyos
+            run_cmd "show version | tee /tmp/v; grep -q '1\\.4\\.3' /tmp/v" "__V143__" 120
+            send -- "sudo poweroff\r"
+            expect eof
+            exit 0
+          }
+
+          if {$mode eq "upgrade151"} {
+            login_vyos
+            run_cmd "sudo dd if=/dev/sr0 of=/tmp/vyos-1.5.1.iso bs=4M status=none" "__COPY__" 300
+            run_cmd "test -s /tmp/vyos-1.5.1.iso" "__ISO__" 60
+
+            send -- "add system image /tmp/vyos-1.5.1.iso\r"
+            set timeout 1200
+            set done 0
+            while {!$done} {
+              expect {
+                -re {Would you like to continue\? \[y/N\]} { send -- "y\r" }
+                -re {Do you want to continue\? \[y/N\]} { send -- "y\r" }
+                -re {What would you like to name this image\?.*} { send -- "\r" }
+                -re {Would you like to save the current configuration.*} { send -- "y\r" }
+                -re {installed successfully|Installation complete|installation completed} { set done 1 }
+                -re {vyos@[^:\r\n]+:[^\r\n]*[$#] *$} { set done 1 }
+                -re {compatibility check failed|aborting installation|Traceback} {
+                  puts stderr "ERROR: native add system image failed"; exit 40
+                }
+                timeout { puts stderr "ERROR: timeout adding 1.5.1"; exit 41 }
+                eof { puts stderr "ERROR: console closed adding 1.5.1"; exit 42 }
+              }
+            }
+
+            run_cmd "show system image | tee /tmp/i; grep -q '1\\.5\\.1' /tmp/i" "__I151__" 120
+            send -- "reboot\r"
+            expect {
+              -re {Proceed with reboot\? \[confirm\]} { send -- "\r"; exp_continue }
+              eof {}
+              timeout {}
+            }
+            exit 0
+          }
+
+          if {$mode eq "verify151"} {
+            login_vyos
+            run_cmd "show version | tee /tmp/v; grep -q '1\\.5\\.1' /tmp/v" "__V151__" 180
+            run_cmd "show system image | tee /tmp/i; grep -q '1\\.5\\.1' /tmp/i && grep -q '1\\.4\\.3' /tmp/i" "__BOTH__" 120
+            send -- "sudo poweroff\r"
+            expect eof
+            exit 0
+          }
+
+          puts stderr "unknown mode: $mode"
+          exit 2
+          EXP
+          chmod +x console.exp
+
+      - name: Install VyOS 1.4.3 into virtual disk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ./qemu-helper.sh start "$ISO_143" d
+          timeout 1500 ./console.exp install143 2>&1 | tee install143.log
+          ./qemu-helper.sh stop || true
+          qemu-img check "$DISK"
+
+      - name: Boot installed VyOS 1.4.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ./qemu-helper.sh start "" c
+          timeout 600 ./console.exp verify143 2>&1 | tee verify143.log
+          ./qemu-helper.sh stop || true
+
+      - name: Add VyOS 1.5.1 using native command
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ./qemu-helper.sh start "$ISO_151" c
+          timeout 1500 ./console.exp upgrade151 2>&1 | tee upgrade151.log
+          ./qemu-helper.sh stop || true
+
+      - name: Boot and verify VyOS 1.5.1
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ./qemu-helper.sh start "" c
+          timeout 600 ./console.exp verify151 2>&1 | tee verify151.log
+          ./qemu-helper.sh stop || true
+          echo "PASS: real VyOS 1.4.3 -> 1.5.1 VM E2E"
+
+      - name: Stop VM
+        if: always()
+        shell: bash
+        run: ./qemu-helper.sh stop || true
+
+      - name: Collect disk diagnostics
+        if: always()
+        shell: bash
+        run: |
+          qemu-img info "$DISK" > disk-info.txt 2>&1 || true
+          qemu-img check "$DISK" > disk-check.txt 2>&1 || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyos-143-to-151-e2e-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            iso-sha256.txt
+            qemu.log
+            install143.log
+            verify143.log
+            upgrade151.log
+            verify151.log
+            disk-info.txt
+            disk-check.txt
+            qemu-helper.sh
+            console.exp

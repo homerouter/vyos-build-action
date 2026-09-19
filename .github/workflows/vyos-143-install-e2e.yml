@@ -1,0 +1,453 @@
+name: VyOS 1.4.3 install E2E
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: vyos-test-images
+  ISO_143: vyos-1.4.3-generic-amd64.iso
+  DISK: vyos-143-e2e.qcow2
+
+jobs:
+  install-vyos-143:
+    name: Install and boot VyOS 1.4.3
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install QEMU and Expect
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            expect \
+            curl \
+            file
+
+      - name: Download VyOS 1.4.3 test ISO
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 2 \
+            --output "${ISO_143}" \
+            "${base}/${ISO_143}"
+
+          test -s "${ISO_143}"
+          ls -lh "${ISO_143}"
+          file "${ISO_143}"
+          sha256sum "${ISO_143}" | tee iso-sha256.txt
+
+      - name: Create virtual disk
+        run: |
+          set -euxo pipefail
+          qemu-img create -f qcow2 "${DISK}" 8G
+          qemu-img info "${DISK}"
+
+      - name: Create VyOS 1.4.3 installer driver
+        run: |
+          cat > install143.exp <<'EXPECT'
+          #!/usr/bin/expect -f
+
+          set timeout 300
+          log_user 1
+          log_file -a install143-transcript.log
+
+          set iso $env(ISO_143)
+          set disk $env(DISK)
+
+          proc fail {message} {
+              puts stderr "\nERROR: $message"
+              exit 1
+          }
+
+          proc send_line {value} {
+              send -- "$value\r"
+          }
+
+          spawn qemu-system-x86_64 \
+              -machine accel=tcg \
+              -cpu max \
+              -m 2048 \
+              -smp 2 \
+              -drive file=$disk,if=virtio,format=qcow2 \
+              -cdrom $iso \
+              -boot d \
+              -nographic \
+              -no-reboot
+
+          # The live image normally boots directly.  Ignore boot noise until
+          # the actual VyOS login prompt appears.
+          expect {
+              -re {(?i)vyos login:\s*$} {
+                  send_line "vyos"
+              }
+              timeout {
+                  fail "VyOS 1.4.3 live login prompt not reached"
+              }
+              eof {
+                  fail "QEMU exited before VyOS live login"
+              }
+          }
+
+          expect {
+              -re {(?i)password:\s*$} {
+                  send_line "vyos"
+              }
+              timeout {
+                  fail "live password prompt not reached"
+              }
+              eof {
+                  fail "QEMU exited during live login"
+              }
+          }
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]\s*$} {
+                  send_line "install image"
+              }
+              timeout {
+                  fail "VyOS live shell not reached"
+              }
+              eof {
+                  fail "QEMU exited before live shell"
+              }
+          }
+
+          # VyOS 1.4.3 native installer interaction.
+          expect {
+              -re {Would you like to continue\?\s*\[y/N\]\s*$} {
+                  send_line "y"
+              }
+              timeout {
+                  fail "installer confirmation prompt not reached"
+              }
+              eof {
+                  fail "QEMU exited at installer confirmation"
+              }
+          }
+
+          expect {
+              -re {What would you like to name this image\?.*Default:\s*1\.4\.3.*\)\s*$} {
+                  # Accept the default image name.
+                  send_line ""
+              }
+              timeout {
+                  fail "image-name prompt not reached"
+              }
+              eof {
+                  fail "QEMU exited at image-name prompt"
+              }
+          }
+
+          expect {
+              -re {Please enter a password for the "vyos" user:\s*$} {
+                  send_line "vyos"
+              }
+              timeout {
+                  fail "new vyos password prompt not reached"
+              }
+              eof {
+                  fail "QEMU exited at password prompt"
+              }
+          }
+
+          expect {
+              -re {Please confirm password for the "vyos" user:\s*$} {
+                  send_line "vyos"
+              }
+              timeout {
+                  fail "password confirmation prompt not reached"
+              }
+              eof {
+                  fail "QEMU exited at password confirmation"
+              }
+          }
+
+          expect {
+              -re {What console should be used by default\?.*Default:\s*S.*\)\s*$} {
+                  # Keep serial as the default console.
+                  send_line ""
+              }
+              timeout {
+                  fail "default-console prompt not reached"
+              }
+              eof {
+                  fail "QEMU exited at console prompt"
+              }
+          }
+
+          expect {
+              -re {Which one should be used for installation\?.*Default:\s*/dev/vda.*\)\s*$} {
+                  # The test VM has exactly one persistent disk.
+                  send_line ""
+              }
+              timeout {
+                  fail "installation disk prompt not reached"
+              }
+              eof {
+                  fail "QEMU exited at disk selection"
+              }
+          }
+
+          # 1.4.x installers may ask for partition sizing and/or destructive
+          # confirmation.  Match the prompts by meaning rather than depending
+          # on one exact line wrapping.
+          expect {
+              -re {(?i)(how big.*root|root partition.*size|partition.*size).*default.*\)\s*$} {
+                  send_line ""
+                  exp_continue
+              }
+              -re {(?i)(all data|destroy|delete|format|partition).*(continue|proceed|sure).*\[y/N\]\s*$} {
+                  send_line "y"
+                  exp_continue
+              }
+              -re {(?i)(continue|proceed).*\[y/N\]\s*$} {
+                  send_line "y"
+                  exp_continue
+              }
+              -re {(?i)(installation completed successfully|installation complete|installed successfully)} {
+                  # Some releases return to the shell after this message.
+              }
+              -re {vyos@vyos[^\r\n]*[$#]\s*$} {
+                  # Installer returned to the live shell.
+              }
+              timeout {
+                  fail "installer did not complete within timeout"
+              }
+              eof {
+                  fail "QEMU exited before installation completed"
+              }
+          }
+
+          # If completion text was seen before the shell prompt, wait for the
+          # shell.  If the shell was already consumed, this harmless newline
+          # produces another prompt.
+          send_line ""
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]\s*$} {
+                  send_line "sync"
+              }
+              timeout {
+                  fail "live shell not available after installation"
+              }
+              eof {
+                  fail "QEMU exited after installation"
+              }
+          }
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]\s*$} {
+                  send_line "sudo poweroff"
+              }
+              timeout {
+                  fail "sync did not return to shell"
+              }
+              eof {
+                  # A shutdown immediately after sync is also acceptable.
+                  exit 0
+              }
+          }
+
+          expect {
+              -re {(?i)(power down|reboot: power down|system halted)} {
+                  exit 0
+              }
+              eof {
+                  exit 0
+              }
+              timeout {
+                  # The disk has already been synced.  Do not leave QEMU
+                  # running forever if shutdown output differs.
+                  send "\035"
+                  exit 0
+              }
+          }
+          EXPECT
+
+          chmod +x install143.exp
+
+      - name: Install VyOS 1.4.3 into qcow2
+        run: |
+          set -euxo pipefail
+          : > install143-transcript.log
+          timeout 1200 ./install143.exp
+
+          echo
+          echo "======================================================"
+          echo " Installed disk"
+          echo "======================================================"
+          qemu-img info "${DISK}"
+          ls -lh "${DISK}"
+
+      - name: Create installed-system boot verifier
+        run: |
+          cat > verify143.exp <<'EXPECT'
+          #!/usr/bin/expect -f
+
+          set timeout 300
+          log_user 1
+          log_file -a verify143-transcript.log
+
+          set disk $env(DISK)
+
+          proc fail {message} {
+              puts stderr "\nERROR: $message"
+              exit 1
+          }
+
+          proc send_line {value} {
+              send -- "$value\r"
+          }
+
+          spawn qemu-system-x86_64 \
+              -machine accel=tcg \
+              -cpu max \
+              -m 2048 \
+              -smp 2 \
+              -drive file=$disk,if=virtio,format=qcow2 \
+              -boot c \
+              -nographic \
+              -no-reboot
+
+          expect {
+              -re {(?i)vyos login:\s*$} {
+                  send_line "vyos"
+              }
+              timeout {
+                  fail "installed VyOS login prompt not reached"
+              }
+              eof {
+                  fail "QEMU exited before installed-system login"
+              }
+          }
+
+          expect {
+              -re {(?i)password:\s*$} {
+                  send_line "vyos"
+              }
+              timeout {
+                  fail "installed-system password prompt not reached"
+              }
+              eof {
+                  fail "QEMU exited during installed-system login"
+              }
+          }
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]\s*$} {
+                  send_line "show version"
+              }
+              timeout {
+                  fail "installed VyOS shell not reached"
+              }
+              eof {
+                  fail "QEMU exited before installed shell"
+              }
+          }
+
+          expect {
+              -re {Version:\s+VyOS\s+1\.4\.3} {
+                  # Version verified.  Wait for the command prompt.
+              }
+              -re {VyOS\s+1\.4\.3} {
+                  # Accept alternate show-version formatting.
+              }
+              timeout {
+                  fail "installed system did not report VyOS 1.4.3"
+              }
+              eof {
+                  fail "QEMU exited while checking installed version"
+              }
+          }
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]\s*$} {
+                  send_line "sudo poweroff"
+              }
+              timeout {
+                  fail "shell prompt not returned after show version"
+              }
+              eof {
+                  exit 0
+              }
+          }
+
+          expect {
+              eof {
+                  exit 0
+              }
+              -re {(?i)(power down|reboot: power down|system halted)} {
+                  exit 0
+              }
+              timeout {
+                  send "\035"
+                  exit 0
+              }
+          }
+          EXPECT
+
+          chmod +x verify143.exp
+
+      - name: Boot installed VyOS 1.4.3 and verify version
+        run: |
+          set -euxo pipefail
+          : > verify143-transcript.log
+          timeout 600 ./verify143.exp
+
+          grep -E 'VyOS[[:space:]]+1\.4\.3|Version:[[:space:]]+VyOS[[:space:]]+1\.4\.3' \
+            verify143-transcript.log
+
+          echo
+          echo "PASS: VyOS 1.4.3 was installed to qcow2 and booted successfully."
+
+      - name: Validate qcow2
+        if: always()
+        run: |
+          set +e
+          echo "======================================================"
+          echo " qcow2 diagnostics"
+          echo "======================================================"
+          qemu-img info "${DISK}" || true
+          qemu-img check "${DISK}" || true
+          ls -lh "${DISK}" || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyos-143-install-e2e-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            install143-transcript.log
+            verify143-transcript.log
+            iso-sha256.txt
+            install143.exp
+            verify143.exp
+
+      - name: Upload installed VyOS 1.4.3 qcow2
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyos-1.4.3-installed-qcow2
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 1
+          path: vyos-143-e2e.qcow2

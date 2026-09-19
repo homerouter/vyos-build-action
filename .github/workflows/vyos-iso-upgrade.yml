@@ -1,0 +1,719 @@
+name: VyOS 1.4.3 -> 1.5.1 E2E Upgrade
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vyos-143-to-151-e2e
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: vyos-test-images
+
+  VYOS_143_ISO: vyos-1.4.3-generic-amd64.iso
+  VYOS_151_ISO: vyos-1.5.1-generic-amd64.iso
+
+  VM_DISK: vyos-test.qcow2
+
+  VM_MEMORY: 4096
+  VM_CPUS: 2
+
+jobs:
+  upgrade-e2e:
+    name: VyOS 1.4.3 -> 1.5.1 real upgrade
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      # ------------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # ------------------------------------------------------------
+      # Host dependencies
+      # ------------------------------------------------------------
+
+      - name: Install QEMU and test dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            expect \
+            socat \
+            jq \
+            file
+
+          echo
+          echo "======================================================"
+          echo " QEMU"
+          echo "======================================================"
+
+          qemu-system-x86_64 --version
+          qemu-img --version
+          expect -v
+
+      # ------------------------------------------------------------
+      # Download immutable test images from GitHub Release
+      # ------------------------------------------------------------
+
+      - name: Download VyOS test images
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p images
+
+          gh release download "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${VYOS_143_ISO}" \
+            --pattern "${VYOS_151_ISO}" \
+            --dir images
+
+          echo
+          echo "======================================================"
+          echo " Downloaded test images"
+          echo "======================================================"
+
+          ls -lh images/
+
+          test -s "images/${VYOS_143_ISO}"
+          test -s "images/${VYOS_151_ISO}"
+
+          echo
+          file "images/${VYOS_143_ISO}"
+          file "images/${VYOS_151_ISO}"
+
+          echo
+          sha256sum \
+            "images/${VYOS_143_ISO}" \
+            "images/${VYOS_151_ISO}"
+
+      # ------------------------------------------------------------
+      # Create VM disk
+      # ------------------------------------------------------------
+
+      - name: Create VM disk
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          qemu-img create \
+            -f qcow2 \
+            "${VM_DISK}" \
+            8G
+
+          qemu-img info "${VM_DISK}"
+
+      # ------------------------------------------------------------
+      # Helper scripts
+      # ------------------------------------------------------------
+
+      - name: Create QEMU helpers
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p test-bin logs
+
+          cat > test-bin/start-vm.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          ISO="${1:-}"
+          BOOT="${2:-disk}"
+
+          rm -f \
+            vm.serial \
+            vm.monitor \
+            vm.pid
+
+          args=(
+            -name vyos-e2e
+            -machine accel=tcg
+            -cpu max
+            -smp "${VM_CPUS:-2}"
+            -m "${VM_MEMORY:-4096}"
+            -drive "file=${VM_DISK},format=qcow2,if=virtio"
+            -nographic
+            -serial "unix:vm.serial,server=on,wait=off"
+            -monitor "unix:vm.monitor,server=on,wait=off"
+            -pidfile vm.pid
+            -no-reboot
+          )
+
+          if [[ -n "${ISO}" ]]; then
+            args+=(
+              -cdrom "${ISO}"
+            )
+          fi
+
+          if [[ "${BOOT}" == "cdrom" ]]; then
+            args+=(
+              -boot order=d
+            )
+          else
+            args+=(
+              -boot order=c
+            )
+          fi
+
+          qemu-system-x86_64 "${args[@]}" \
+            >logs/qemu.stdout.log \
+            2>logs/qemu.stderr.log &
+
+          for i in $(seq 1 60); do
+            if [[ -S vm.serial ]]; then
+              exit 0
+            fi
+
+            sleep 1
+          done
+
+          echo "ERROR: serial socket did not appear"
+          cat logs/qemu.stderr.log || true
+          exit 1
+          EOF
+
+          chmod +x test-bin/start-vm.sh
+
+          cat > test-bin/stop-vm.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          if [[ -S vm.monitor ]]; then
+            printf 'quit\n' | \
+              socat - UNIX-CONNECT:vm.monitor || true
+          fi
+
+          if [[ -f vm.pid ]]; then
+            PID="$(cat vm.pid)"
+
+            for i in $(seq 1 30); do
+              if ! kill -0 "${PID}" 2>/dev/null; then
+                break
+              fi
+
+              sleep 1
+            done
+
+            if kill -0 "${PID}" 2>/dev/null; then
+              kill "${PID}" || true
+            fi
+          fi
+
+          rm -f vm.serial vm.monitor vm.pid
+          EOF
+
+          chmod +x test-bin/stop-vm.sh
+
+      # ------------------------------------------------------------
+      # Boot live VyOS 1.4.3
+      # ------------------------------------------------------------
+
+      - name: Boot VyOS 1.4.3 live ISO
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ./test-bin/start-vm.sh \
+            "images/${VYOS_143_ISO}" \
+            cdrom
+
+          test -S vm.serial
+
+      # ------------------------------------------------------------
+      # Install VyOS 1.4.3 onto qcow2
+      #
+      # This intentionally uses the real installer.
+      # ------------------------------------------------------------
+
+      - name: Install VyOS 1.4.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > /tmp/install-143.exp <<'EOF'
+          set timeout 600
+
+          log_file -noappend logs/install-143-console.log
+
+          spawn socat STDIO UNIX-CONNECT:vm.serial
+
+          # --------------------------------------------------------
+          # Login to live image
+          # --------------------------------------------------------
+
+          expect {
+              -re {vyos login:} {
+                  send "vyos\r"
+              }
+              timeout {
+                  puts "ERROR: VyOS login prompt not found"
+                  exit 1
+              }
+          }
+
+          expect {
+              -re {Password:} {
+                  send "vyos\r"
+              }
+              timeout {
+                  puts "ERROR: password prompt not found"
+                  exit 1
+              }
+          }
+
+          expect {
+              -re {vyos@.*[$#]} {}
+              timeout {
+                  puts "ERROR: VyOS shell prompt not found"
+                  exit 1
+              }
+          }
+
+          # --------------------------------------------------------
+          # Verify live version
+          # --------------------------------------------------------
+
+          send "show version\r"
+
+          expect {
+              -re {1\.4\.3} {}
+              timeout {
+                  puts "ERROR: live system is not VyOS 1.4.3"
+                  exit 1
+              }
+          }
+
+          expect -re {vyos@.*[$#]}
+
+          # --------------------------------------------------------
+          # Start installer
+          # --------------------------------------------------------
+
+          send "install image\r"
+
+          # The installer prompts differ slightly between releases.
+          # Match the semantic questions rather than one exact string.
+
+          while {1} {
+              expect {
+                  -re {Would you like to continue.*Y/n} {
+                      send "y\r"
+                  }
+
+                  -re {What would you like to name this image.*} {
+                      send "\r"
+                  }
+
+                  -re {Please enter a password.*} {
+                      send "vyos\r"
+                  }
+
+                  -re {Please confirm password.*} {
+                      send "vyos\r"
+                  }
+
+                  -re {Which one should be used for installation.*} {
+                      send "\r"
+                  }
+
+                  -re {Select installation partition.*} {
+                      send "\r"
+                  }
+
+                  -re {Install the image on.*Y/n} {
+                      send "y\r"
+                  }
+
+                  -re {Continue.*y/N} {
+                      send "y\r"
+                  }
+
+                  -re {Do you want to continue.*} {
+                      send "y\r"
+                  }
+
+                  -re {vyos@.*[$#]} {
+                      break
+                  }
+
+                  -re {Installation completed} {
+                      exp_continue
+                  }
+
+                  timeout {
+                      puts "ERROR: timeout while installing VyOS 1.4.3"
+                      exit 1
+                  }
+
+                  eof {
+                      puts "ERROR: console closed during installation"
+                      exit 1
+                  }
+              }
+          }
+
+          send "sync\r"
+          expect -re {vyos@.*[$#]}
+
+          exit 0
+          EOF
+
+          expect /tmp/install-143.exp
+
+      # ------------------------------------------------------------
+      # Stop live VM
+      # ------------------------------------------------------------
+
+      - name: Stop VyOS 1.4.3 live VM
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./test-bin/stop-vm.sh || true
+
+      # ------------------------------------------------------------
+      # Boot installed VyOS 1.4.3
+      # ------------------------------------------------------------
+
+      - name: Boot installed VyOS 1.4.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ./test-bin/start-vm.sh "" disk
+
+          test -S vm.serial
+
+      # ------------------------------------------------------------
+      # Verify installed 1.4.3
+      # ------------------------------------------------------------
+
+      - name: Verify installed VyOS 1.4.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > /tmp/verify-143.exp <<'EOF'
+          set timeout 300
+
+          log_file -noappend logs/verify-143-console.log
+
+          spawn socat STDIO UNIX-CONNECT:vm.serial
+
+          expect {
+              -re {vyos login:} {
+                  send "vyos\r"
+              }
+
+              timeout {
+                  puts "ERROR: installed VyOS login prompt not found"
+                  exit 1
+              }
+          }
+
+          expect -re {Password:}
+          send "vyos\r"
+
+          expect {
+              -re {vyos@.*[$#]} {}
+
+              timeout {
+                  puts "ERROR: unable to login to installed VyOS"
+                  exit 1
+              }
+          }
+
+          send "show version\r"
+
+          expect {
+              -re {1\.4\.3} {}
+
+              timeout {
+                  puts "ERROR: installed image is not VyOS 1.4.3"
+                  exit 1
+              }
+          }
+
+          expect -re {vyos@.*[$#]}
+
+          send "cat /opt/vyatta/etc/version\r"
+
+          expect {
+              -re {1\.4\.3} {}
+
+              timeout {
+                  puts "ERROR: version file does not contain 1.4.3"
+                  exit 1
+              }
+          }
+
+          expect -re {vyos@.*[$#]}
+
+          puts ""
+          puts "PASS: installed VyOS 1.4.3 booted successfully"
+
+          exit 0
+          EOF
+
+          expect /tmp/verify-143.exp
+
+      # ------------------------------------------------------------
+      # Stop VM before attaching target ISO
+      # ------------------------------------------------------------
+
+      - name: Stop installed VyOS 1.4.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ./test-bin/stop-vm.sh
+
+      # ------------------------------------------------------------
+      # Boot 1.4.3 from disk with 1.5.1 ISO attached
+      #
+      # IMPORTANT:
+      # disk remains first boot device.
+      # ------------------------------------------------------------
+
+      - name: Boot VyOS 1.4.3 with VyOS 1.5.1 ISO attached
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ./test-bin/start-vm.sh \
+            "images/${VYOS_151_ISO}" \
+            disk
+
+          test -S vm.serial
+
+      # ------------------------------------------------------------
+      # Real add system image test
+      # ------------------------------------------------------------
+
+      - name: Add VyOS 1.5.1 using native VyOS 1.4.3 installer
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > /tmp/add-151.exp <<'EOF'
+          set timeout 600
+
+          log_file -noappend logs/add-151-console.log
+
+          spawn socat STDIO UNIX-CONNECT:vm.serial
+
+          expect {
+              -re {vyos login:} {
+                  send "vyos\r"
+              }
+
+              timeout {
+                  puts "ERROR: VyOS login prompt not found"
+                  exit 1
+              }
+          }
+
+          expect -re {Password:}
+          send "vyos\r"
+
+          expect {
+              -re {vyos@.*[$#]} {}
+
+              timeout {
+                  puts "ERROR: unable to login"
+                  exit 1
+              }
+          }
+
+          # --------------------------------------------------------
+          # Verify source system
+          # --------------------------------------------------------
+
+          send "show version\r"
+
+          expect {
+              -re {1\.4\.3} {}
+
+              timeout {
+                  puts "ERROR: source system is not VyOS 1.4.3"
+                  exit 1
+              }
+          }
+
+          expect -re {vyos@.*[$#]}
+
+          # --------------------------------------------------------
+          # Find attached CD-ROM
+          # --------------------------------------------------------
+
+          send "lsblk -o NAME,TYPE,FSTYPE,SIZE,MOUNTPOINTS\r"
+          expect -re {vyos@.*[$#]}
+
+          send "sudo mkdir -p /mnt/vyos151iso\r"
+          expect -re {vyos@.*[$#]}
+
+          # QEMU normally exposes the CD-ROM as /dev/sr0.
+          send "sudo mount -o ro /dev/sr0 /mnt/vyos151iso\r"
+
+          expect {
+              -re {vyos@.*[$#]} {}
+
+              timeout {
+                  puts "ERROR: unable to mount VyOS 1.5.1 ISO"
+                  exit 1
+              }
+          }
+
+          send "cat /mnt/vyos151iso/version.json\r"
+
+          expect {
+              -re {\"version\": \"1\.5\.1\"} {}
+
+              timeout {
+                  puts "ERROR: attached ISO is not VyOS 1.5.1"
+                  exit 1
+              }
+          }
+
+          expect -re {vyos@.*[$#]}
+
+          # --------------------------------------------------------
+          # CRITICAL TEST
+          #
+          # Run the real native VyOS 1.4.3 add-system-image path.
+          # --------------------------------------------------------
+
+          send "add system image /dev/sr0\r"
+
+          while {1} {
+              expect {
+                  -re {Would you like to continue.*Y/n} {
+                      send "y\r"
+                  }
+
+                  -re {What would you like to name this image.*} {
+                      send "\r"
+                  }
+
+                  -re {Do you want to continue.*} {
+                      send "y\r"
+                  }
+
+                  -re {Continue.*y/N} {
+                      send "y\r"
+                  }
+
+                  -re {Are you sure.*} {
+                      send "y\r"
+                  }
+
+                  -re {Image compatibility check failed} {
+                      puts ""
+                      puts "FAIL: VyOS 1.4.3 rejected VyOS 1.5.1"
+                      puts "      during native image compatibility validation."
+                      exit 1
+                  }
+
+                  -re {Downgrading image-tools} {
+                      puts ""
+                      puts "FAIL: image-tools compatibility rejected target."
+                      exit 1
+                  }
+
+                  -re {vyos@.*[$#]} {
+                      break
+                  }
+
+                  timeout {
+                      puts ""
+                      puts "ERROR: timeout during add system image"
+                      exit 1
+                  }
+
+                  eof {
+                      puts ""
+                      puts "ERROR: console closed during add system image"
+                      exit 1
+                  }
+              }
+          }
+
+          # --------------------------------------------------------
+          # Verify image is registered
+          # --------------------------------------------------------
+
+          send "show system image\r"
+
+          expect {
+              -re {1\.5\.1} {}
+
+              timeout {
+                  puts ""
+                  puts "FAIL: VyOS 1.5.1 was not registered after installation"
+                  exit 1
+              }
+          }
+
+          expect -re {vyos@.*[$#]}
+
+          puts ""
+          puts "======================================================"
+          puts " PASS"
+          puts " VyOS 1.4.3 accepted and installed VyOS 1.5.1"
+          puts " through the native add system image path."
+          puts "======================================================"
+
+          send "sync\r"
+          expect -re {vyos@.*[$#]}
+
+          exit 0
+          EOF
+
+          expect /tmp/add-151.exp
+
+      # ------------------------------------------------------------
+      # Reboot to target image
+      # ------------------------------------------------------------
+
+      - name: Stop VM after VyOS 1.5.1 installation
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ./test-bin/stop-vm.sh
+
+      - name: Boot upgraded system
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ./test-bin/start-vm.sh "" disk
+
+          test -S vm.serial
+
+      # ------------------------------------------------------------
+      # Final verification
+      # ------------------------------------------------------------
+
+      - name: Verify VyOS 1.5.1 boot
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > /tmp/verify-151.exp <<'EOF'
+          set timeout 

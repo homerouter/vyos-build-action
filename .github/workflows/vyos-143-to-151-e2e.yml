@@ -167,13 +167,20 @@ jobs:
                 -re {Do you want to continue\? \[y/N\]} { send -- "y\r" }
                 -re {What would you like to name this image\?.*} { send -- "\r" }
                 -re {Select installation type:.*} { send -- "\r" }
-                -re {Which one should be used for installation\?.*} { send -- "\r" }
+                -re {Which one should be used for installation\?.*} { send -- "/dev/vda\r" }
                 -re {Would you like to use all the free space on the drive\?.*} { send -- "y\r" }
                 -re {How big of a root partition should I create\?.*} { send -- "\r" }
-                -re {What console should be used by default\?.*} { send -- "\r" }
+                -re {What should be the size of the root partition\?.*} { send -- "\r" }
+                -re {Enter partition size.*} { send -- "\r" }
+                -re {What console should be used by default\?.*} { send -- "S\r" }
                 -re {Please enter a password for the "vyos" user:.*} { send -- "vyos\r" }
                 -re {Please confirm password for the "vyos" user:.*} { send -- "vyos\r" }
-                -re {Which drive should GRUB modify.*} { send -- "\r" }
+                -re {Installation will delete all data.*continue\?.*} { send -- "y\r" }
+                -re {This will destroy all data.*continue\?.*} { send -- "y\r" }
+                -re {Are you sure.*\[y/N\].*} { send -- "y\r" }
+                -re {Which drive should GRUB modify.*} { send -- "/dev/vda\r" }
+                -re {Which disk should GRUB be installed on.*} { send -- "/dev/vda\r" }
+                -re {Install the GRUB boot loader.*} { send -- "y\r" }
                 -re {Installation complete|installation completed|installed successfully} { set done 1 }
                 -re {vyos@[^:\r\n]+:[^\r\n]*[$#] *$} { set done 1 }
                 timeout { puts stderr "ERROR: timeout installing 1.4.3"; exit 30 }

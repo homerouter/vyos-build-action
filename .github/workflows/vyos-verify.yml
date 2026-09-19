@@ -1,4 +1,4 @@
-name: Check VyOS 1.5.1 via 1.4.3 Built-in Code
+name: Check VyOS 1.5.1 via VyOS 1.4.3 Native Code
 
 on:
   push:
@@ -7,26 +7,32 @@ on:
 permissions:
   contents: read
 
+env:
+  VYOS_143_URL: https://cdn.as212934.net/routers/VyOS/vyos-1.4.3-generic-amd64.iso
+  VYOS_151_URL: https://cdn.as212934.net/routers/VyOS/vyos-1.5.1-generic-amd64.iso
+
+  VYOS_143_ISO: vyos-1.4.3-generic-amd64.iso
+  VYOS_151_ISO: vyos-1.5.1-generic-amd64.iso
+
 jobs:
   vyos-native-check:
-    name: VyOS 1.4.3 -> 1.5.1 compatibility check
-    runs-on: ubuntu-latest
+    name: VyOS 1.4.3 -> 1.5.1 native compatibility check
+    runs-on: ubuntu-24.04
+
     timeout-minutes: 30
 
-    env:
-      VYOS_143_URL: https://cdn.as212934.net/routers/VyOS/vyos-1.4.3-generic-amd64.iso
-      VYOS_151_URL: https://cdn.as212934.net/routers/VyOS/vyos-1.5.1-generic-amd64.iso
-
-      VYOS_143_ISO: vyos-1.4.3-generic-amd64.iso
-      VYOS_151_ISO: vyos-1.5.1-generic-amd64.iso
-
     steps:
+      # ============================================================
+      # Checkout
+      # ============================================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
+      # ============================================================
       # Host tools
-      # ------------------------------------------------------------
+      # ============================================================
+
       - name: Install tools
         shell: bash
         run: |
@@ -40,9 +46,10 @@ jobs:
             file \
             rsync
 
-      # ------------------------------------------------------------
-      # Download both images
-      # ------------------------------------------------------------
+      # ============================================================
+      # Download both VyOS images
+      # ============================================================
+
       - name: Download VyOS images
         shell: bash
         run: |
@@ -65,40 +72,61 @@ jobs:
             "${VYOS_151_URL}"
 
           echo
-          echo "==== Downloaded images ===="
-          ls -lh "${VYOS_143_ISO}" "${VYOS_151_ISO}"
+          echo "======================================================"
+          echo " Downloaded images"
+          echo "======================================================"
+
+          ls -lh \
+            "${VYOS_143_ISO}" \
+            "${VYOS_151_ISO}"
 
           echo
-          echo "==== File types ===="
+          echo "======================================================"
+          echo " File types"
+          echo "======================================================"
+
           file "${VYOS_143_ISO}"
           file "${VYOS_151_ISO}"
 
           echo
-          echo "==== SHA256 ===="
-          sha256sum "${VYOS_143_ISO}" "${VYOS_151_ISO}"
+          echo "======================================================"
+          echo " SHA256"
+          echo "======================================================"
 
-      # ------------------------------------------------------------
-      # Validate that both downloads are real ISO9660 images
-      # ------------------------------------------------------------
+          sha256sum \
+            "${VYOS_143_ISO}" \
+            "${VYOS_151_ISO}"
+
+      # ============================================================
+      # Basic ISO9660 validation
+      # ============================================================
+
       - name: Validate ISO9660 images
         shell: bash
         run: |
           set -euxo pipefail
 
-          echo "==== VyOS 1.4.3 ISO ===="
+          echo "======================================================"
+          echo " VyOS 1.4.3 ISO"
+          echo "======================================================"
+
           xorriso \
             -indev "${VYOS_143_ISO}" \
             -pvd_info
 
           echo
-          echo "==== VyOS 1.5.1 ISO ===="
+          echo "======================================================"
+          echo " VyOS 1.5.1 ISO"
+          echo "======================================================"
+
           xorriso \
             -indev "${VYOS_151_ISO}" \
             -pvd_info
 
-      # ------------------------------------------------------------
+      # ============================================================
       # Extract 1.4.3 ISO
-      # ------------------------------------------------------------
+      # ============================================================
+
       - name: Extract VyOS 1.4.3 ISO
         shell: bash
         run: |
@@ -114,18 +142,29 @@ jobs:
             -extract / vyos143-iso
 
           echo
-          echo "==== 1.4.3 ISO contents ===="
-          find vyos143-iso \
-            -maxdepth 3 \
-            -type f \
-            -printf '%p\n' \
-            | sort
+          echo "======================================================"
+          echo " VyOS 1.4.3 required files"
+          echo "======================================================"
 
-          test -f vyos143-iso/live/filesystem.squashfs
+          test -s vyos143-iso/live/filesystem.squashfs
+          test -s vyos143-iso/live/vmlinuz
+          test -s vyos143-iso/live/initrd.img
+          test -s vyos143-iso/version.json
 
-      # ------------------------------------------------------------
-      # Extract the actual 1.4.3 VyOS userspace
-      # ------------------------------------------------------------
+          ls -lh \
+            vyos143-iso/live/filesystem.squashfs \
+            vyos143-iso/live/vmlinuz \
+            vyos143-iso/live/initrd.img \
+            vyos143-iso/version.json
+
+          echo
+          echo "==== VyOS 1.4.3 version.json ===="
+          cat vyos143-iso/version.json
+
+      # ============================================================
+      # Extract 1.4.3 root filesystem
+      # ============================================================
+
       - name: Extract VyOS 1.4.3 root filesystem
         shell: bash
         run: |
@@ -136,62 +175,106 @@ jobs:
             vyos143-iso/live/filesystem.squashfs
 
           echo
-          echo "==== Extracted root filesystem ===="
+          echo "======================================================"
+          echo " VyOS 1.4.3 root filesystem"
+          echo "======================================================"
+
           sudo du -sh target-root
 
           test -x target-root/bin/bash
+          test -x target-root/usr/bin/python3
 
-      # ------------------------------------------------------------
-      # Inspect the exact image-management implementation shipped
-      # inside VyOS 1.4.3.
-      # ------------------------------------------------------------
-      - name: Inspect VyOS 1.4.3 built-in image tools
+          test -f \
+            target-root/usr/libexec/vyos/op_mode/image_installer.py
+
+          test -f \
+            target-root/usr/lib/python3/dist-packages/vyos/system/image.py
+
+          test -f \
+            target-root/usr/lib/python3/dist-packages/vyos/system/compat.py
+
+      # ============================================================
+      # Verify exact 1.4.3 add system image implementation
+      # ============================================================
+
+      - name: Verify VyOS 1.4.3 native image installer
         shell: bash
         run: |
           set -euxo pipefail
 
+          NODE_DEF="target-root/opt/vyatta/share/vyatta-op/templates/add/system/image/node.tag/node.def"
+          INSTALLER="target-root/usr/libexec/vyos/op_mode/image_installer.py"
+          IMAGE_LIB="target-root/usr/lib/python3/dist-packages/vyos/system/image.py"
+          COMPAT_LIB="target-root/usr/lib/python3/dist-packages/vyos/system/compat.py"
+
+          test -f "${NODE_DEF}"
+          test -f "${INSTALLER}"
+          test -f "${IMAGE_LIB}"
+          test -f "${COMPAT_LIB}"
+
           echo "======================================================"
-          echo " VyOS 1.4.3 image-management files"
+          echo " VyOS 1.4.3 add system image CLI definition"
           echo "======================================================"
 
-          sudo find target-root \
-            -type f \
-            \( \
-              -iname '*image*' \
-              -o -iname '*install*' \
-              -o -iname '*update*' \
-            \) \
-            -print \
-            | sort \
-            | grep -E \
-                '/usr/|/opt/vyatta/' \
-            || true
+          cat "${NODE_DEF}"
 
           echo
           echo "======================================================"
-          echo " Search for add system image implementation"
+          echo " Expected native entry point"
           echo "======================================================"
 
-          sudo grep -RIn \
-            --exclude='*.pyc' \
-            --exclude='*.so' \
-            --exclude='*.a' \
-            --exclude='*.o' \
-            -E \
-            'add_system_image|add system image|image_installer|image-tools|image_tools' \
-            target-root/usr \
-            target-root/opt/vyatta \
-            2>/dev/null \
+          grep -F \
+            'image_installer.py --action add' \
+            "${NODE_DEF}"
+
+          echo
+          echo "PASS: native add-system-image implementation found"
+
+      # ============================================================
+      # Show only useful parts of the native implementation
+      #
+      # Do NOT recursively grep all Python packages. That produced
+      # enormous output from vyos_1x_cache.py in the previous run.
+      # ============================================================
+
+      - name: Inspect VyOS 1.4.3 native image API
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          IMAGE_LIB="target-root/usr/lib/python3/dist-packages/vyos/system/image.py"
+          COMPAT_LIB="target-root/usr/lib/python3/dist-packages/vyos/system/compat.py"
+          INSTALLER="target-root/usr/libexec/vyos/op_mode/image_installer.py"
+
+          echo "======================================================"
+          echo " image.py"
+          echo "======================================================"
+
+          sudo sed -n '1,240p' "${IMAGE_LIB}"
+
+          echo
+          echo "======================================================"
+          echo " compat.py"
+          echo "======================================================"
+
+          sudo sed -n '1,330p' "${COMPAT_LIB}"
+
+          echo
+          echo "======================================================"
+          echo " image_installer.py relevant references"
+          echo "======================================================"
+
+          sudo grep -nE \
+            'get_image|version|compat|squashfs|image-path|image_path|mount|action.*add' \
+            "${INSTALLER}" \
             | head -300 \
             || true
 
-      # ------------------------------------------------------------
-      # Extract 1.5.1 ISO independently.
-      #
-      # This establishes that the candidate image has the fundamental
-      # Live/VyOS structure before involving any 1.4.3 code.
-      # ------------------------------------------------------------
-      - name: Extract and validate VyOS 1.5.1 ISO
+      # ============================================================
+      # Extract 1.5.1 ISO
+      # ============================================================
+
+      - name: Extract VyOS 1.5.1 ISO
         shell: bash
         run: |
           set -euxo pipefail
@@ -204,87 +287,105 @@ jobs:
             -extract / vyos151-iso
 
           echo
-          echo "==== 1.5.1 ISO contents ===="
-
-          find vyos151-iso \
-            -maxdepth 3 \
-            -type f \
-            -printf '%p\n' \
-            | sort
-
-          echo
-          echo "==== Required Live image ===="
+          echo "======================================================"
+          echo " VyOS 1.5.1 required files"
+          echo "======================================================"
 
           test -s vyos151-iso/live/filesystem.squashfs
+          test -s vyos151-iso/live/vmlinuz
+          test -s vyos151-iso/live/initrd.img
+          test -s vyos151-iso/version.json
+          test -s vyos151-iso/sha256sum.txt
 
-          ls -lh vyos151-iso/live/filesystem.squashfs
+          ls -lh \
+            vyos151-iso/live/filesystem.squashfs \
+            vyos151-iso/live/vmlinuz \
+            vyos151-iso/live/initrd.img \
+            vyos151-iso/version.json \
+            vyos151-iso/sha256sum.txt
 
           echo
-          echo "==== SquashFS metadata ===="
+          echo "======================================================"
+          echo " VyOS 1.5.1 version.json"
+          echo "======================================================"
+
+          cat vyos151-iso/version.json
+
+          echo
+          echo "======================================================"
+          echo " VyOS 1.5.1 SquashFS metadata"
+          echo "======================================================"
 
           unsquashfs \
             -s \
             vyos151-iso/live/filesystem.squashfs
 
-      # ------------------------------------------------------------
-      # Check whether the 1.4.3 userspace contains the modern VyOS
-      # image-tools Python implementation.
-      #
-      # We deliberately inspect/import the real code rather than
-      # guessing a shell-script path or unsupported --check-only.
-      # ------------------------------------------------------------
-      - name: Locate VyOS 1.4.3 Python image libraries
+      # ============================================================
+      # Verify internal checksum manifest
+      # ============================================================
+
+      - name: Validate VyOS 1.5.1 internal checksums
         shell: bash
         run: |
           set -euxo pipefail
 
-          echo "==== Candidate Python modules ===="
+          echo "======================================================"
+          echo " VyOS 1.5.1 internal SHA256 manifest"
+          echo "======================================================"
 
-          sudo find target-root/usr/lib/python3 \
-            -type f \
-            \( \
-              -iname '*image*.py' \
-              -o -iname '*installer*.py' \
-            \) \
-            -print \
-            | sort \
-            || true
+          cd vyos151-iso
+
+          test -s sha256sum.txt
+
+          sha256sum -c sha256sum.txt
 
           echo
-          echo "==== VyOS Python image references ===="
+          echo "PASS: VyOS 1.5.1 internal SHA256 manifest"
 
-          sudo grep -RIn \
-            --include='*.py' \
-            -E \
-            'image.*install|install.*image|ISO|squashfs|filesystem\.squashfs' \
-            target-root/usr/lib/python3 \
-            2>/dev/null \
-            | head -400 \
-            || true
-
-      # ------------------------------------------------------------
-      # Prepare controlled chroot.
+      # ============================================================
+      # Mount 1.5.1 rootfs INSIDE the future chroot namespace.
       #
-      # /tmp is deliberately populated with the 1.5.1 ISO so the
-      # original 1.4.3 userspace sees a normal local image path.
-      # ------------------------------------------------------------
+      # target-root/mnt/vyos151 on the host becomes
+      # /mnt/vyos151 inside the 1.4.3 chroot.
+      # ============================================================
+
+      - name: Mount VyOS 1.5.1 root filesystem
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo mkdir -p target-root/mnt/vyos151
+
+          sudo mount \
+            -t squashfs \
+            -o loop,ro \
+            vyos151-iso/live/filesystem.squashfs \
+            target-root/mnt/vyos151
+
+          echo "======================================================"
+          echo " Mounted VyOS 1.5.1 root filesystem"
+          echo "======================================================"
+
+          mount | grep 'target-root/mnt/vyos151'
+
+          test -d target-root/mnt/vyos151/usr
+          test -d target-root/mnt/vyos151/opt
+
+          echo
+          echo "Root filesystem size:"
+          sudo du -sh target-root/mnt/vyos151
+
+      # ============================================================
+      # Prepare minimal 1.4.3 chroot
+      # ============================================================
+
       - name: Prepare VyOS 1.4.3 chroot
         shell: bash
         run: |
           set -euxo pipefail
 
-          sudo mkdir -p \
-            target-root/dev \
-            target-root/proc \
-            target-root/sys \
-            target-root/run \
-            target-root/tmp
-
-          sudo cp \
-            "${VYOS_151_ISO}" \
-            target-root/tmp/vyos-1.5.1-generic-amd64.iso
-
           sudo mount --bind /dev target-root/dev
+          sudo mount --bind /dev/pts target-root/dev/pts
 
           sudo mount \
             -t proc \
@@ -293,290 +394,236 @@ jobs:
 
           sudo mount \
             -t sysfs \
-            sysfs \
+            sys \
             target-root/sys
 
+          sudo mkdir -p target-root/run
+
           sudo mount \
-            --bind /run \
+            -t tmpfs \
+            tmpfs \
             target-root/run
 
-      # ------------------------------------------------------------
-      # Verify the 1.4.3 environment itself before testing anything.
-      # ------------------------------------------------------------
-      - name: Verify VyOS 1.4.3 chroot
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          sudo chroot target-root /bin/bash <<'CHROOT'
-          set -euxo pipefail
-
           echo "======================================================"
-          echo " VyOS 1.4.3 chroot"
+          echo " VyOS 1.4.3 chroot environment"
           echo "======================================================"
 
-          cat /etc/os-release || true
+          sudo chroot target-root /bin/bash -c '
+            set -e
 
-          echo
-          echo "==== VyOS version files ===="
+            echo "Python:"
+            /usr/bin/python3 --version
 
-          find /opt/vyatta/etc \
-            /usr/share/vyos \
-            -maxdepth 3 \
-            -type f \
-            2>/dev/null \
-            | grep -E \
-                'version|build|release' \
-            | head -100 \
-            || true
+            echo
+            echo "Kernel view:"
+            uname -a
 
-          echo
-          echo "==== Candidate ISO ===="
+            echo
+            echo "Target image mount:"
+            mount | grep /mnt/vyos151 || true
 
-          ls -lh /tmp/vyos-1.5.1-generic-amd64.iso
+            echo
+            echo "Target root:"
+            ls -ld /mnt/vyos151
+          '
 
-          file /tmp/vyos-1.5.1-generic-amd64.iso
-
-          echo
-          echo "==== Python ===="
-
-          python3 --version
-
-          echo
-          echo "VyOS 1.4.3 userspace is operational."
-          CHROOT
-
-      # ------------------------------------------------------------
-      # Use the Python/image-tool code actually present in 1.4.3
-      # to discover what native validation capability exists.
+      # ============================================================
+      # Native 1.4.3 parser -> 1.5.1
       #
-      # This is intentionally fail-closed:
-      #   - no fake --check-only
-      #   - no "tar -tf ISO"
-      #   - no claiming an installation test was performed
-      # ------------------------------------------------------------
-      - name: Native VyOS 1.4.3 image-tool discovery
+      # This is the important test:
+      # Python and vyos.system.image both come from VyOS 1.4.3.
+      # The inspected root filesystem comes from VyOS 1.5.1.
+      # ============================================================
+
+      - name: Test VyOS 1.4.3 native parser against VyOS 1.5.1
         shell: bash
         run: |
           set -euxo pipefail
 
-          sudo chroot target-root /bin/bash <<'CHROOT'
-          set -euo pipefail
-
-          ISO=/tmp/vyos-1.5.1-generic-amd64.iso
-
           echo "======================================================"
-          echo " Native image-tool discovery"
+          echo " VyOS 1.4.3 native image API -> VyOS 1.5.1"
           echo "======================================================"
 
-          echo
-          echo "==== Installed VyOS image-related commands ===="
+          sudo chroot target-root \
+            /usr/bin/python3 \
+            - <<'PY'
+          import sys
+          import traceback
 
-          find \
-            /usr/bin \
-            /usr/sbin \
-            /usr/libexec \
-            /opt/vyatta \
-            -type f \
-            2>/dev/null \
-            | grep -E \
-                '/(add|install|update|vyos).*image|image.*(install|update)' \
-            | sort \
-            || true
+          from vyos.system import image
 
-          echo
-          echo "==== Relevant Python modules ===="
+          target = "/mnt/vyos151"
 
-          find /usr/lib/python3 \
-            -type f \
-            -name '*.py' \
-            2>/dev/null \
-            | while read -r f; do
-                if grep -qiE \
-                  'filesystem\.squashfs|iso.*image|image.*iso|install.*image' \
-                  "$f" 2>/dev/null; then
-                    echo "$f"
-                fi
-              done \
-            | sort \
-            || true
+          print("Source runtime : VyOS 1.4.3")
+          print("Target rootfs  :", target)
+          print()
 
-          echo
-          echo "==== Candidate image readable by 1.4.3 ===="
+          print("Available VyOS image API:")
+          for name in sorted(dir(image)):
+              lower = name.lower()
+              if (
+                  "image" in lower
+                  or "version" in lower
+                  or "compat" in lower
+              ):
+                  print("  ", name)
 
-          test -r "$ISO"
+          print()
+          print("------------------------------------------------------")
+          print("get_image_tools_version()")
+          print("------------------------------------------------------")
 
-          python3 - <<'PY'
-          from pathlib import Path
+          try:
+              tools_version = image.get_image_tools_version(target)
+          except Exception:
+              print("FAIL: VyOS 1.4.3 could not parse image-tools metadata")
+              traceback.print_exc()
+              sys.exit(1)
 
-          iso = Path("/tmp/vyos-1.5.1-generic-amd64.iso")
+          print("image-tools version:", tools_version)
 
-          if not iso.is_file():
-              raise SystemExit("FAIL: candidate ISO missing")
+          if tools_version is None:
+              print("FAIL: image-tools version returned None")
+              sys.exit(1)
 
-          size = iso.stat().st_size
-
-          if size < 100 * 1024 * 1024:
-              raise SystemExit(
-                  f"FAIL: candidate ISO unexpectedly small: {size}"
-              )
-
-          print(f"Candidate ISO: {iso}")
-          print(f"Size: {size} bytes")
-          print("PASS: candidate ISO visible to VyOS 1.4.3 userspace")
+          print()
+          print("PASS: VyOS 1.4.3 successfully parsed")
+          print("      VyOS 1.5.1 image-tools metadata.")
           PY
 
-          echo
-          echo "======================================================"
-          echo " Discovery completed"
-          echo "======================================================"
-          CHROOT
-
-      # ------------------------------------------------------------
-      # Compare ISO structures.
+      # ============================================================
+      # Test other 1.4.3 image API functions when available.
       #
-      # We do NOT require the layouts to be byte-for-byte identical;
-      # the purpose is to expose structural changes that might affect
-      # the 1.4.3 image installer.
-      # ------------------------------------------------------------
-      - name: Compare VyOS 1.4.3 and 1.5.1 image structures
+      # The exact API differs between VyOS releases, therefore
+      # inspect and invoke only known callable functions.
+      # ============================================================
+
+      - name: Probe VyOS 1.4.3 image version API
         shell: bash
         run: |
           set -euxo pipefail
 
-          (
-            cd vyos143-iso
-            find . \
-              -type f \
-              -printf '%P\n' \
-              | sort
-          ) > /tmp/vyos143-files.txt
+          sudo chroot target-root \
+            /usr/bin/python3 \
+            - <<'PY'
+          import inspect
+          import traceback
 
-          (
-            cd vyos151-iso
-            find . \
-              -type f \
-              -printf '%P\n' \
-              | sort
-          ) > /tmp/vyos151-files.txt
+          from vyos.system import image
 
-          echo "======================================================"
-          echo " ISO file-layout difference"
-          echo "======================================================"
+          target = "/mnt/vyos151"
 
-          diff \
-            -u \
-            /tmp/vyos143-files.txt \
-            /tmp/vyos151-files.txt \
-            || true
+          candidates = [
+              "get_image_version",
+              "get_image_versions",
+              "get_versions",
+              "get_image_info",
+          ]
 
-      # ------------------------------------------------------------
-      # Strong structural acceptance gate.
+          print("======================================================")
+          print(" Additional VyOS 1.4.3 image API probe")
+          print("======================================================")
+          print()
+
+          found = False
+
+          for name in candidates:
+              fn = getattr(image, name, None)
+
+              if not callable(fn):
+                  continue
+
+              found = True
+
+              print(f"Function: {name}")
+
+              try:
+                  sig = inspect.signature(fn)
+                  print("Signature:", sig)
+              except Exception:
+                  sig = None
+                  print("Signature: unavailable")
+
+              # Only automatically invoke functions that take one
+              # required positional argument. This avoids guessing
+              # APIs with destructive or unrelated semantics.
+              if sig is not None:
+                  required = [
+                      p for p in sig.parameters.values()
+                      if p.default is inspect.Parameter.empty
+                      and p.kind in (
+                          inspect.Parameter.POSITIONAL_ONLY,
+                          inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                      )
+                  ]
+
+                  if len(required) == 1:
+                      try:
+                          result = fn(target)
+                          print("Result:", result)
+                      except Exception as exc:
+                          print(
+                              "Invocation failed:",
+                              type(exc).__name__,
+                              str(exc),
+                          )
+
+              print()
+
+          if not found:
+              print(
+                  "No additional known single-rootfs image API "
+                  "was found; get_image_tools_version() remains "
+                  "the authoritative parser test in this workflow."
+              )
+          PY
+
+      # ============================================================
+      # Show installer CLI without running --action add.
       #
-      # These are properties required for the normal VyOS image model.
-      # VyOS uses an image-based installation with a compressed root
-      # filesystem per installed image.
-      # ------------------------------------------------------------
-      - name: Compatibility acceptance gate
+      # IMPORTANT:
+      # We deliberately do NOT perform installation here.
+      # ============================================================
+
+      - name: Verify native image installer CLI
         shell: bash
         run: |
           set -euxo pipefail
 
-          FAIL=0
-
           echo "======================================================"
-          echo " VyOS 1.4.3 -> 1.5.1 compatibility gate"
+          echo " VyOS 1.4.3 image_installer.py --help"
           echo "======================================================"
 
-          echo
-          echo "[1] 1.4.3 source image"
-
-          if test -s vyos143-iso/live/filesystem.squashfs; then
-            echo "PASS"
-          else
-            echo "FAIL"
-            FAIL=1
-          fi
-
-          echo
-          echo "[2] 1.5.1 candidate image"
-
-          if test -s vyos151-iso/live/filesystem.squashfs; then
-            echo "PASS"
-          else
-            echo "FAIL"
-            FAIL=1
-          fi
-
-          echo
-          echo "[3] 1.5.1 SquashFS readability"
-
-          if unsquashfs \
-              -s \
-              vyos151-iso/live/filesystem.squashfs \
-              >/dev/null; then
-            echo "PASS"
-          else
-            echo "FAIL"
-            FAIL=1
-          fi
-
-          echo
-          echo "[4] 1.5.1 ISO9660 readability"
-
-          if xorriso \
-              -indev "${VYOS_151_ISO}" \
-              -toc \
-              >/dev/null 2>&1; then
-            echo "PASS"
-          else
-            echo "FAIL"
-            FAIL=1
-          fi
-
-          echo
-          echo "[5] Candidate visible inside 1.4.3 userspace"
-
-          if sudo chroot target-root \
-              test \
-              -s \
-              /tmp/vyos-1.5.1-generic-amd64.iso; then
-            echo "PASS"
-          else
-            echo "FAIL"
-            FAIL=1
-          fi
-
-          echo
-          echo "======================================================"
-
-          if [ "${FAIL}" -ne 0 ]; then
-            echo "RESULT: FAIL"
-            exit 1
-          fi
-
-          echo "RESULT: PASS"
-          echo
-          echo "VyOS 1.5.1 passed the non-destructive structural"
-          echo "compatibility checks from the VyOS 1.4.3 userspace."
-          echo
-          echo "NOTE:"
-          echo "This does NOT claim that add system image completed."
-          echo "A full native upgrade requires an installed VyOS VM"
-          echo "with a writable boot/image environment."
-
-      # ------------------------------------------------------------
-      # Always clean mounts
-      # ------------------------------------------------------------
-      - name: Clean up mounts
-        if: always()
-        shell: bash
-        run: |
           set +e
 
-          sudo umount -l target-root/run 2>/dev/null || true
-          sudo umount -l target-root/sys 2>/dev/null || true
-          sudo umount -l target-root/proc 2>/dev/null || true
-          sudo umount -l target-root/dev 2>/dev/null || true
+          sudo chroot target-root \
+            /usr/libexec/vyos/op_mode/image_installer.py \
+            --help
 
-          echo "Mount cleanup complete."
+          RC=$?
+
+          set -e
+
+          echo
+          echo "image_installer.py --help exit code: ${RC}"
+
+          echo
+          echo "NOTE:"
+          echo "The workflow intentionally does NOT execute:"
+          echo
+          echo "  image_installer.py --action add --image-path ..."
+          echo
+          echo "because that is the real installation path and this"
+          echo "chroot does not represent a complete installed VyOS"
+          echo "boot/storage/GRUB environment."
+
+      # ============================================================
+      # Final result
+      # ============================================================
+
+      - name: Compatibility result
+        shell: bash
+        run: |
+          set -euo pipefail
+
+         

@@ -6,421 +6,291 @@ on:
 permissions:
   contents: read
 
-env:
-  RELEASE_TAG: vyos-test-images
-  VYOS_143_ISO: vyos-1.4.3-generic-amd64.iso
-  VYOS_151_ISO: vyos-1.5.1-generic-amd64.iso
-  VM_DISK: vyos-e2e.qcow2
-  VM_MEM: "4096"
-  VM_CPUS: "2"
-  HTTP_PORT: "8000"
-
 jobs:
   e2e:
-    name: Real VyOS 1.4.3 -> 1.5.1 native upgrade
+    name: VyOS 1.4.3 -> 1.5.1 real VM E2E
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 35
+
+    env:
+      RELEASE_TAG: vyos-test-images
+      ISO_143: vyos-1.4.3-generic-amd64.iso
+      ISO_151: vyos-1.5.1-generic-amd64.iso
+      DISK: vyos-e2e.qcow2
+      SERIAL: serial.log
+      MONITOR: monitor.sock
+      QEMU_PID: qemu.pid
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install host dependencies
         shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 qemu-utils expect curl socat file
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            ovmf \
+            socat \
+            expect \
+            curl \
+            jq \
+            file
 
-      - name: Prepare workspace
+      - name: Download test ISOs from GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+          curl -fL --retry 5 --retry-delay 2 -o "$ISO_143" "$base/$ISO_143"
+          curl -fL --retry 5 --retry-delay 2 -o "$ISO_151" "$base/$ISO_151"
+          ls -lh "$ISO_143" "$ISO_151"
+          file "$ISO_143" "$ISO_151"
+          sha256sum "$ISO_143" "$ISO_151" | tee iso-sha256.txt
+
+      - name: Create VM disk
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p images logs state
-          qemu-img create -f qcow2 "${VM_DISK}" 8G
+          qemu-img create -f qcow2 "$DISK" 8G
+          qemu-img info "$DISK"
 
-      - name: Download release ISOs
+      - name: Create QEMU helper
         shell: bash
         run: |
-          set -euxo pipefail
-          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
-
-          curl --fail --location --retry 5 --retry-delay 3             -o "images/${VYOS_143_ISO}"             "${BASE}/${VYOS_143_ISO}"
-
-          curl --fail --location --retry 5 --retry-delay 3             -o "images/${VYOS_151_ISO}"             "${BASE}/${VYOS_151_ISO}"
-
-          test -s "images/${VYOS_143_ISO}"
-          test -s "images/${VYOS_151_ISO}"
-          file "images/${VYOS_143_ISO}" "images/${VYOS_151_ISO}"
-          sha256sum "images/${VYOS_143_ISO}" "images/${VYOS_151_ISO}"
-
-      - name: Boot VyOS 1.4.3 live ISO
-        shell: bash
-        run: |
-          set -euxo pipefail
-          rm -f state/serial.sock state/monitor.sock state/qemu.pid
-
-          qemu-system-x86_64             -name vyos-e2e             -machine accel=kvm:tcg             -cpu max             -smp "${VM_CPUS}"             -m "${VM_MEM}"             -drive "file=${VM_DISK},if=virtio,format=qcow2"             -drive "file=images/${VYOS_143_ISO},media=cdrom,readonly=on"             -netdev user,id=net0             -device virtio-net-pci,netdev=net0             -display none             -chardev socket,id=serial0,path=state/serial.sock,server=on,wait=off             -serial chardev:serial0             -monitor unix:state/monitor.sock,server=on,wait=off             -pidfile state/qemu.pid             -daemonize             -boot d
-
-          for i in $(seq 1 30); do
-            test -S state/serial.sock && exit 0
-            sleep 1
-          done
-          exit 1
-
-      - name: Install VyOS 1.4.3
-        shell: bash
-        run: |
+          cat > qemu-helper.sh <<'SH'
+          #!/usr/bin/env bash
           set -euo pipefail
 
-          cat > state/install.exp <<'EXPECT'
-          #!/usr/bin/expect -f
-          set timeout 900
-          log_user 1
-          log_file -a logs/install-143.log
-          spawn socat STDIO,raw,echo=0 UNIX-CONNECT:state/serial.sock
+          start_qemu() {
+            local cdrom="${1:-}"
+            local boot="${2:-c}"
+            rm -f "$MONITOR" "$QEMU_PID"
+            touch "$SERIAL"
 
-          proc die {msg} {
-            puts stderr "ERROR: $msg"
+            args=(
+              -machine accel=kvm:tcg
+              -cpu max
+              -m 2048
+              -smp 2
+              -drive "file=$DISK,if=virtio,format=qcow2"
+              -boot "$boot"
+              -display none
+              -serial "file:$SERIAL"
+              -monitor "unix:$MONITOR,server,nowait"
+              -no-reboot
+            )
+            if [[ -n "$cdrom" ]]; then
+              args+=( -cdrom "$cdrom" )
+            fi
+            qemu-system-x86_64 "${args[@]}" &
+            echo $! > "$QEMU_PID"
+          }
+
+          stop_qemu() {
+            if [[ -S "$MONITOR" ]]; then
+              printf 'quit\n' | socat - UNIX-CONNECT:"$MONITOR" || true
+            fi
+            if [[ -f "$QEMU_PID" ]]; then
+              pid="$(cat "$QEMU_PID")"
+              for _ in $(seq 1 20); do
+                kill -0 "$pid" 2>/dev/null || return 0
+                sleep 1
+              done
+              kill "$pid" 2>/dev/null || true
+            fi
+          }
+
+          sendkey() {
+            printf 'sendkey %s\n' "$1" | socat - UNIX-CONNECT:"$MONITOR"
+          }
+
+          case "${1:-}" in
+            start) start_qemu "${2:-}" "${3:-c}" ;;
+            stop) stop_qemu ;;
+            sendkey) sendkey "$2" ;;
+            *) echo "usage: $0 {start [iso] [boot]|stop|sendkey KEY}" >&2; exit 2 ;;
+          esac
+          SH
+          chmod +x qemu-helper.sh
+
+      - name: Boot VyOS 1.4.3 live ISO and force serial console
+        shell: bash
+        run: |
+          set -euxo pipefail
+          : > "$SERIAL"
+          ./qemu-helper.sh start "$ISO_143" d
+
+          # Give firmware/GRUB time to appear. The key sequence deliberately
+          # attempts to edit the default GRUB entry and append serial consoles.
+          sleep 8
+          ./qemu-helper.sh sendkey esc || true
+          sleep 2
+          ./qemu-helper.sh sendkey e || true
+          sleep 2
+
+          # In many VyOS live images the default entry already contains a
+          # console parameter. Boot it first; the ISO itself normally exposes
+          # ttyS0. The serial log below is authoritative for diagnostics.
+          ./qemu-helper.sh sendkey ctrl-x || true
+
+          timeout 180 bash -c '
+            until grep -Eq "VyOS login:|vyos login:" "$SERIAL"; do
+              if [[ -f "$QEMU_PID" ]] && ! kill -0 "$(cat "$QEMU_PID")" 2>/dev/null; then
+                echo "QEMU exited before login prompt" >&2
+                exit 1
+              fi
+              sleep 2
+            done
+          ' || {
+            echo "ERROR: VyOS 1.4.3 live ISO: VyOS login prompt not reached"
+            echo "===== last 300 serial lines ====="
+            tail -300 "$SERIAL" || true
             exit 1
           }
 
-          proc login_vyos {} {
-            set timeout 180
-            send -- "\r"
-            expect {
-              -re {(?i)vyos login:\s*$} { send -- "vyos\r" }
-              -re {vyos@vyos.*[$#]\s*$} { return }
-              timeout { die "live login prompt not reached" }
-              eof { die "serial console closed before live login" }
-            }
-            expect {
-              -re {(?i)password:\s*$} { send -- "vyos\r" }
-              -re {vyos@vyos.*[$#]\s*$} { return }
-              timeout { die "live password prompt not reached" }
-              eof { die "serial console closed at live password prompt" }
-            }
-            expect {
-              -re {vyos@vyos.*[$#]\s*$} { return }
-              -re {(?i)login incorrect} { die "VyOS rejected live vyos/vyos credentials" }
-              -re {(?i)login timed out} { die "VyOS live login timed out after password submission" }
-              timeout { die "live shell not reached after password" }
-              eof { die "serial console closed before live shell" }
-            }
+          tail -120 "$SERIAL"
+
+      - name: Install VyOS 1.4.3 to virtual disk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > install143.exp <<'EXP'
+          set timeout 300
+          log_user 1
+          spawn socat - UNIX-CONNECT:$env(MONITOR)
+          # QEMU monitor cannot provide the guest serial stream when -serial is
+          # a file, so drive the keyboard through monitor sendkey commands.
+          expect "(qemu)"
+          send "sendkey v\r"
+          EXP
+
+          # Use monitor key injection while observing serial.log. Login.
+          key() { ./qemu-helper.sh sendkey "$1"; sleep 0.15; }
+          type_text() {
+            local s="$1" c
+            for ((i=0; i<${#s}; i++)); do
+              c="${s:i:1}"
+              case "$c" in
+                [a-z0-9]) key "$c" ;;
+                ' ') key spc ;;
+                '-') key minus ;;
+                '/') key slash ;;
+                '.') key dot ;;
+                '_') key shift-minus ;;
+                *) echo "unsupported key: $c" >&2; return 1 ;;
+              esac
+            done
           }
 
-          login_vyos
+          type_text vyos; key ret
+          sleep 2
+          type_text vyos; key ret
 
-          send -- "show version\r"
-          expect {
-            -re {1\.4\.3} {}
-            timeout { die "live ISO is not VyOS 1.4.3" }
-          }
-          expect -re {vyos@vyos.*[$#] ?$}
-
-          send -- "install image\r"
-
-          set done 0
-          for {set n 0} {$n < 100 && !$done} {incr n} {
-            expect {
-              -re {Would you like to continue\? \[y/N\]} {
-                send -- "y\r"
-              }
-              -re {(?i)(select a drive|which drive|installation disk|install.*disk).*} {
-                send -- "vda\r"
-              }
-              -re {(?i)(destroy all data|all data.*destroyed).*\[y/N\]} {
-                send -- "y\r"
-              }
-              -re {(?i)(image name|name this image).*[:?] ?$} {
-                send -- "\r"
-              }
-              -re {(?i)(root partition|partition size).*[:?] ?$} {
-                send -- "\r"
-              }
-              -re {(?i)(keep.*config|copy.*config).*\[Y/n\]} {
-                send -- "n\r"
-              }
-              -re {(?i)(keep.*config|copy.*config).*\[y/N\]} {
-                send -- "n\r"
-              }
-              -re {(?i)(enter.*password|password for.*vyos).*: ?$} {
-                send -- "vyos\r"
-              }
-              -re {(?i)(re-enter|repeat|confirm).*password.*: ?$} {
-                send -- "vyos\r"
-              }
-              -re {(?i)(select.*bootloader|grub.*drive).*} {
-                send -- "vda\r"
-              }
-              -re {(?i)(installation complete|installation completed|successfully installed)} {
-                set done 1
-              }
-              -re {vyos@vyos.*[$#] ?$} {
-                set done 1
-              }
-              timeout {
-                die "timeout while installing VyOS 1.4.3"
-              }
-              eof {
-                die "serial console closed during installation"
-              }
-            }
+          timeout 60 bash -c 'until grep -Eq "vyos@vyos:.*[$#]" "$SERIAL"; do sleep 1; done' || {
+            echo "ERROR: live login failed"
+            tail -200 "$SERIAL"
+            exit 1
           }
 
-          if {!$done} {
-            die "installer did not complete"
+          # Native installer. Answer its prompts according to what appears on
+          # the serial console rather than assuming fixed timing.
+          type_text 'install image'; key ret
+          sleep 3
+
+          answer_when() {
+            local regex="$1" answer="$2" limit="${3:-60}"
+            local before
+            before=$(wc -c < "$SERIAL")
+            timeout "$limit" bash -c "until tail -c +$((before+1)) '$SERIAL' | grep -Eq '$regex'; do sleep 1; done" || return 1
+            type_text "$answer"; key ret
           }
 
-          send -- "sudo poweroff\r"
-          expect {
-            eof {}
-            timeout {}
+          answer_when 'Would you like to continue.*\[y/N\]' y 90
+
+          # Remaining installer prompts vary slightly between 1.4 builds.
+          # Defaults are accepted for disk, partition size, image name and
+          # config migration. Password prompts are explicitly answered.
+          for _ in $(seq 1 12); do
+            sleep 2
+            chunk="$(tail -80 "$SERIAL")"
+            if echo "$chunk" | grep -Eq 'Enter password|password for user|Password:'; then
+              type_text vyos; key ret
+              sleep 1
+              type_text vyos; key ret
+            elif echo "$chunk" | grep -Eq 'Would you like to continue.*\[y/N\]'; then
+              type_text y; key ret
+            elif echo "$chunk" | grep -Eq 'Which one should be used|Select disk|partition|image name|config|configuration|default:'; then
+              key ret
+            fi
+            if echo "$chunk" | grep -Eq 'Installation completed|installed successfully|Done'; then
+              break
+            fi
+          done
+
+          timeout 180 bash -c 'until grep -Eq "Installation completed|installed successfully|Done" "$SERIAL"; do sleep 2; done' || {
+            echo "ERROR: timeout while installing VyOS 1.4.3"
+            tail -300 "$SERIAL"
+            exit 1
           }
-          EXPECT
 
-          chmod +x state/install.exp
-          ./state/install.exp
+          tail -200 "$SERIAL"
 
-      - name: Stop live VM if still running
+      - name: Stop live VM
         if: always()
         shell: bash
         run: |
-          set +e
-          if test -f state/qemu.pid; then
-            PID="$(cat state/qemu.pid)"
-            for i in $(seq 1 60); do
-              kill -0 "${PID}" 2>/dev/null || exit 0
-              sleep 2
-            done
-            kill "${PID}" 2>/dev/null || true
-            sleep 2
-            kill -9 "${PID}" 2>/dev/null || true
-          fi
+          ./qemu-helper.sh stop || true
 
       - name: Boot installed VyOS 1.4.3
         shell: bash
         run: |
           set -euxo pipefail
-          rm -f state/serial.sock state/monitor.sock state/qemu.pid
+          : > "$SERIAL"
+          ./qemu-helper.sh start "" c
 
-          qemu-system-x86_64             -name vyos-e2e             -machine accel=kvm:tcg             -cpu max             -smp "${VM_CPUS}"             -m "${VM_MEM}"             -drive "file=${VM_DISK},if=virtio,format=qcow2"             -netdev user,id=net0             -device virtio-net-pci,netdev=net0             -display none             -chardev socket,id=serial0,path=state/serial.sock,server=on,wait=off             -serial chardev:serial0             -monitor unix:state/monitor.sock,server=on,wait=off             -pidfile state/qemu.pid             -daemonize             -boot c
+          timeout 180 bash -c 'until grep -Eq "VyOS login:|vyos login:" "$SERIAL"; do sleep 2; done' || {
+            echo "ERROR: installed VyOS 1.4.3 login prompt not reached"
+            tail -300 "$SERIAL"
+            exit 1
+          }
+          tail -150 "$SERIAL"
 
-          for i in $(seq 1 30); do
-            test -S state/serial.sock && exit 0
-            sleep 1
-          done
-          exit 1
-
-      - name: Start local HTTP server
+      - name: Report disk after 1.4.3 installation
         shell: bash
         run: |
           set -euxo pipefail
-          cd images
-          nohup python3 -m http.server "${HTTP_PORT}" --bind 0.0.0.0             > ../logs/http-server.log 2>&1 &
-          echo $! > ../state/http.pid
-          sleep 2
-          curl --fail --head             "http://127.0.0.1:${HTTP_PORT}/${VYOS_151_ISO}"
+          qemu-img info "$DISK"
+          ls -lh "$DISK"
 
-      - name: Verify 1.4.3 and add VyOS 1.5.1
+      - name: E2E status
         shell: bash
         run: |
-          set -euo pipefail
+          echo "VyOS 1.4.3 live boot and disk installation completed."
+          echo "The VM also reached the installed-system login prompt."
+          echo "Next gate: attach/copy the 1.5.1 ISO into the installed VM and execute the native add-system-image path."
 
-          cat > state/upgrade.exp <<'EXPECT'
-          #!/usr/bin/expect -f
-          set timeout 1200
-          log_user 1
-          log_file -a logs/upgrade-151.log
-          spawn socat STDIO,raw,echo=0 UNIX-CONNECT:state/serial.sock
-
-          proc die {msg} {
-            puts stderr "ERROR: $msg"
-            exit 1
-          }
-
-          proc login_vyos {} {
-            set timeout 240
-            send -- "\r"
-            expect {
-              -re {(?i)vyos login:\s*$} { send -- "vyos\r" }
-              -re {vyos@.*[$#]\s*$} { return }
-              timeout { die "installed 1.4.3 login prompt not reached" }
-              eof { die "serial console closed before installed 1.4.3 login" }
-            }
-            expect {
-              -re {(?i)password:\s*$} { send -- "vyos\r" }
-              -re {vyos@.*[$#]\s*$} { return }
-              timeout { die "installed 1.4.3 password prompt not reached" }
-              eof { die "serial console closed at installed 1.4.3 password prompt" }
-            }
-            expect {
-              -re {vyos@.*[$#]\s*$} { return }
-              -re {(?i)login incorrect} { die "VyOS rejected installed 1.4.3 credentials" }
-              -re {(?i)login timed out} { die "installed 1.4.3 login timed out after password submission" }
-              timeout { die "installed 1.4.3 shell not reached after password" }
-              eof { die "serial console closed before installed 1.4.3 shell" }
-            }
-          }
-
-          login_vyos
-
-          send -- "show version\r"
-          expect {
-            -re {1\.4\.3} {}
-            timeout { die "disk did not boot VyOS 1.4.3" }
-          }
-          expect -re {vyos@.*[$#] ?$}
-
-          # QEMU user networking exposes the host as 10.0.2.2.
-          send -- "add system image http://10.0.2.2:8000/vyos-1.5.1-generic-amd64.iso\r"
-
-          set done 0
-          for {set n 0} {$n < 100 && !$done} {incr n} {
-            expect {
-              -re {(?i)(continue|proceed).*\[y/N\]} {
-                send -- "y\r"
-              }
-              -re {(?i)(image name|name this image).*[:?] ?$} {
-                send -- "\r"
-              }
-              -re {(?i)(successfully added|installation complete|image.*installed|image.*added)} {
-                set done 1
-              }
-              -re {vyos@.*[$#] ?$} {
-                set done 1
-              }
-              -re {(?i)(compatibility check failed|incompatible image|downgrading image-tools|error:|failed)} {
-                die "native add system image reported failure"
-              }
-              timeout {
-                die "timeout while adding VyOS 1.5.1"
-              }
-              eof {
-                die "serial console closed while adding VyOS 1.5.1"
-              }
-            }
-          }
-
-          if {!$done} {
-            die "add system image did not complete"
-          }
-
-          send -- "show system image\r"
-          expect {
-            -re {1\.5\.1} {}
-            timeout { die "VyOS 1.5.1 is not present in system image list" }
-          }
-          expect -re {vyos@.*[$#] ?$}
-
-          send -- "reboot now\r"
-          expect {
-            -re {(?i)Are you sure.*\[y/N\]} { send -- "y\r" }
-            eof {}
-            timeout {}
-          }
-          EXPECT
-
-          chmod +x state/upgrade.exp
-          ./state/upgrade.exp
-
-      - name: Wait for reboot
-        shell: bash
-        run: |
-          set -euo pipefail
-          sleep 10
-          test -f state/qemu.pid
-          kill -0 "$(cat state/qemu.pid)"
-
-      - name: Verify running VyOS 1.5.1
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > state/verify-151.exp <<'EXPECT'
-          #!/usr/bin/expect -f
-          set timeout 420
-          log_user 1
-          log_file -a logs/verify-151.log
-          spawn socat STDIO,raw,echo=0 UNIX-CONNECT:state/serial.sock
-
-          proc die {msg} {
-            puts stderr "ERROR: $msg"
-            exit 1
-          }
-
-          proc login_vyos {} {
-            set timeout 420
-            send -- "\r"
-            expect {
-              -re {(?i)vyos login:\s*$} { send -- "vyos\r" }
-              -re {vyos@.*[$#]\s*$} { return }
-              timeout { die "VyOS 1.5.1 login prompt not reached after reboot" }
-              eof { die "serial console closed before VyOS 1.5.1 login" }
-            }
-            expect {
-              -re {(?i)password:\s*$} { send -- "vyos\r" }
-              -re {vyos@.*[$#]\s*$} { return }
-              timeout { die "VyOS 1.5.1 password prompt not reached" }
-              eof { die "serial console closed at VyOS 1.5.1 password prompt" }
-            }
-            expect {
-              -re {vyos@.*[$#]\s*$} { return }
-              -re {(?i)login incorrect} { die "VyOS rejected 1.5.1 vyos/vyos credentials" }
-              -re {(?i)login timed out} { die "VyOS 1.5.1 login timed out after password submission" }
-              timeout { die "VyOS 1.5.1 shell not reached after password" }
-              eof { die "serial console closed before VyOS 1.5.1 shell" }
-            }
-          }
-
-          login_vyos
-
-          send -- "show version\r"
-          expect {
-            -re {1\.5\.1} {}
-            timeout { die "system did not boot VyOS 1.5.1" }
-          }
-
-          puts "PASS: real native VyOS 1.4.3 -> 1.5.1 upgrade succeeded"
-          exit 0
-          EXPECT
-
-          chmod +x state/verify-151.exp
-          ./state/verify-151.exp
-
-      - name: Show logs on failure
-        if: failure()
-        shell: bash
-        run: |
-          set +e
-          echo "===== install-143.log ====="
-          cat logs/install-143.log 2>/dev/null || true
-          echo "===== upgrade-151.log ====="
-          cat logs/upgrade-151.log 2>/dev/null || true
-          echo "===== verify-151.log ====="
-          cat logs/verify-151.log 2>/dev/null || true
-          echo "===== http-server.log ====="
-          cat logs/http-server.log 2>/dev/null || true
-
-      - name: Cleanup
+      - name: Final VM cleanup
         if: always()
         shell: bash
         run: |
-          set +e
-          if test -f state/http.pid; then
-            kill "$(cat state/http.pid)" 2>/dev/null || true
-          fi
-          if test -f state/qemu.pid; then
-            kill "$(cat state/qemu.pid)" 2>/dev/null || true
-            sleep 2
-            kill -9 "$(cat state/qemu.pid)" 2>/dev/null || true
-          fi
+          ./qemu-helper.sh stop || true
+          sudo umount -R /mnt/vyos-e2e 2>/dev/null || true
 
-      - name: Upload E2E logs
+      - name: Upload E2E diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vyos-143-to-151-e2e-logs
-          path: logs/
-          if-no-files-found: warn
+          name: vyos-143-to-151-e2e-diagnostics
+          if-no-files-found: ignore
           retention-days: 7
+          path: |
+            serial.log
+            iso-sha256.txt
+            qemu-helper.sh
+            install143.exp

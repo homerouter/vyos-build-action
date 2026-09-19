@@ -1,0 +1,203 @@
+name: Publish VyOS Test ISOs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-vyos-test-isos
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: vyos-test-images
+
+  VYOS_143_URL: https://cdn.as212934.net/routers/VyOS/vyos-1.4.3-generic-amd64.iso
+  VYOS_143_ISO: vyos-1.4.3-generic-amd64.iso
+  VYOS_143_SHA256: 9ad00a5c462be94d80b3bf20410f27eb165c3aa5a0dc7cefd55477fd94fc66a0
+
+  VYOS_151_URL: https://cdn.as212934.net/routers/VyOS/vyos-1.5.1-generic-amd64.iso
+  VYOS_151_ISO: vyos-1.5.1-generic-amd64.iso
+  VYOS_151_SHA256: 548482ed6a12c2b804e4a6dda95b5a0a2b830604b59736631fd90256edb86ec8
+
+jobs:
+  publish:
+    name: Publish VyOS ISO test fixtures
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "======================================================"
+          echo " VyOS test ISO publication"
+          echo "======================================================"
+          echo
+          echo "Release tag : ${RELEASE_TAG}"
+          echo
+          echo "VyOS 1.4.3:"
+          echo "  URL       : ${VYOS_143_URL}"
+          echo "  Filename  : ${VYOS_143_ISO}"
+          echo "  SHA256    : ${VYOS_143_SHA256}"
+          echo
+          echo "VyOS 1.5.1:"
+          echo "  URL       : ${VYOS_151_URL}"
+          echo "  Filename  : ${VYOS_151_ISO}"
+          echo "  SHA256    : ${VYOS_151_SHA256}"
+
+      - name: Create release if necessary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists."
+          else
+            echo "Creating release ${RELEASE_TAG}..."
+
+            gh release create "${RELEASE_TAG}" \
+              --title "VyOS E2E Test Images" \
+              --notes "Pinned VyOS ISO images used by the repository's QEMU upgrade compatibility tests. These assets are test fixtures and are intentionally kept separate from normal build releases."
+          fi
+
+      - name: Check existing release assets
+        id: assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          assets="$(
+            gh release view "${RELEASE_TAG}" \
+              --json assets \
+              --jq '.assets[].name'
+          )"
+
+          echo "Existing assets:"
+          printf '%s\n' "${assets}"
+          echo
+
+          if grep -Fxq "${VYOS_143_ISO}" <<<"${assets}"; then
+            echo "vyos143_exists=true" >> "${GITHUB_OUTPUT}"
+            echo "VyOS 1.4.3 ISO already exists."
+          else
+            echo "vyos143_exists=false" >> "${GITHUB_OUTPUT}"
+            echo "VyOS 1.4.3 ISO needs publication."
+          fi
+
+          if grep -Fxq "${VYOS_151_ISO}" <<<"${assets}"; then
+            echo "vyos151_exists=true" >> "${GITHUB_OUTPUT}"
+            echo "VyOS 1.5.1 ISO already exists."
+          else
+            echo "vyos151_exists=false" >> "${GITHUB_OUTPUT}"
+            echo "VyOS 1.5.1 ISO needs publication."
+          fi
+
+      - name: Download VyOS 1.4.3
+        if: steps.assets.outputs.vyos143_exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 3 \
+            --retry-all-errors \
+            --output "${VYOS_143_ISO}" \
+            "${VYOS_143_URL}"
+
+          test -s "${VYOS_143_ISO}"
+
+      - name: Verify VyOS 1.4.3 SHA256
+        if: steps.assets.outputs.vyos143_exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "${VYOS_143_SHA256}  ${VYOS_143_ISO}" | sha256sum --check -
+
+      - name: Upload VyOS 1.4.3 to release
+        if: steps.assets.outputs.vyos143_exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release upload \
+            "${RELEASE_TAG}" \
+            "${VYOS_143_ISO}"
+
+      - name: Download VyOS 1.5.1
+        if: steps.assets.outputs.vyos151_exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 3 \
+            --retry-all-errors \
+            --output "${VYOS_151_ISO}" \
+            "${VYOS_151_URL}"
+
+          test -s "${VYOS_151_ISO}"
+
+      - name: Verify VyOS 1.5.1 SHA256
+        if: steps.assets.outputs.vyos151_exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "${VYOS_151_SHA256}  ${VYOS_151_ISO}" | sha256sum --check -
+
+      - name: Upload VyOS 1.5.1 to release
+        if: steps.assets.outputs.vyos151_exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release upload \
+            "${RELEASE_TAG}" \
+            "${VYOS_151_ISO}"
+
+      - name: Verify published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          assets="$(
+            gh release view "${RELEASE_TAG}" \
+              --json assets \
+              --jq '.assets[].name'
+          )"
+
+          echo "======================================================"
+          echo " Published assets"
+          echo "======================================================"
+          printf '%s\n' "${assets}"
+          echo
+
+          grep -Fxq "${VYOS_143_ISO}" <<<"${assets}"
+          grep -Fxq "${VYOS_151_ISO}" <<<"${assets}"
+
+          echo
+          echo "PASS: both VyOS test ISOs are available from release:"
+          echo "      ${RELEASE_TAG}"

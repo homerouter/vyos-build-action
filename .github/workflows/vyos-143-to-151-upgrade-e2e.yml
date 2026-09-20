@@ -1,0 +1,940 @@
+name: VyOS 1.4.3 to 1.5.1 Upgrade E2E
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: vyos-test-images
+  ISO_143: vyos-1.4.3-generic-amd64.iso
+  ISO_151: vyos-1.5.1-generic-amd64.iso
+  DISK: vyos-143-e2e.qcow2
+  UPGRADE_MEDIA: vyos-151-upgrade-media.img
+
+jobs:
+  install-and-verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils expect curl file
+
+      - name: Download VyOS 1.4.3 ISO
+        shell: bash
+        run: |
+          set -euxo pipefail
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${ISO_143}"
+          curl --fail --location --retry 5 --retry-delay 2 -o "${ISO_143}" "${url}"
+          test -s "${ISO_143}"
+          sha256sum "${ISO_143}" | tee iso-sha256.txt
+          file "${ISO_143}"
+          ls -lh "${ISO_143}"
+
+      - name: Create qcow2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          qemu-img create -f qcow2 "${DISK}" 8G
+          qemu-img info "${DISK}"
+
+      - name: Create installer expect script
+        shell: bash
+        run: |
+          cat > install143.exp <<'EXPECT'
+          #!/usr/bin/expect -f
+          set timeout 900
+          log_user 1
+          log_file -a install143-transcript.log
+          set iso $env(ISO_143)
+          set disk $env(DISK)
+
+          proc fail {msg} {
+              puts stderr "\nERROR: $msg"
+              exit 1
+          }
+
+          proc sendline {s} {
+              send -- "$s\r"
+          }
+
+          spawn qemu-system-x86_64               -machine accel=tcg               -cpu max               -m 2048               -smp 2               -drive file=$disk,if=virtio,format=qcow2               -cdrom $iso               -boot order=d               -nographic               -no-reboot
+
+          expect {
+              -re {(?i)vyos login:} {
+                  puts "\n>>> live login prompt"
+                  after 300
+                  sendline "vyos"
+
+                  # Do not depend on matching the serial Password: prompt.
+                  # We have observed ttyS0 display it while Expect fails to
+                  # recognize the prompt. login(1) is already waiting for
+                  # the password here, so send it directly after a short delay.
+                  after 1000
+                  puts "\n>>> sending live password"
+                  sendline "vyos"
+              }
+              timeout { fail "live login prompt not reached" }
+              eof { fail "QEMU exited before live login" }
+          }
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]} {
+                  puts "\n>>> live shell reached"
+              }
+              -re {(?i)login incorrect} { fail "live credentials rejected" }
+              -re {(?i)login timed out} { fail "live login timed out after password was sent" }
+              timeout { fail "live shell not reached" }
+              eof { fail "QEMU exited before live shell" }
+          }
+
+          sendline "install image"
+          set done 0
+
+          while {!$done} {
+              expect {
+                  -re {Would you like to continue\?[^\r\n]*\[y/N\]} {
+                      sendline "y"
+                  }
+                  -re {What would you like to name this image\?} {
+                      sendline ""
+                  }
+                  -re {Please enter a password for the "vyos" user:} {
+                      sendline "vyos"
+                  }
+                  -re {Please confirm password for the "vyos" user:} {
+                      sendline "vyos"
+                  }
+                  -re {What console should be used by default\?} {
+                      sendline "S"
+                  }
+                  -re {Which one should be used for installation\?} {
+                      sendline "/dev/vda"
+                  }
+                  -re {(?i)(root partition|partition size|how big)} {
+                      sendline ""
+                  }
+                  -re {(?i)(all data|destroy|erase|delete|format)[^\r\n]*(y/N|Y/n)} {
+                      sendline "y"
+                  }
+
+                  -re {(?i)Would you like to use all the free space on the drive\?[^\r\n]*\[Y/n\]} {
+                      puts "\n>>> using all free space on /dev/vda"
+                      sendline "Y"
+                  }
+
+                  -re {(?i)Which file would you like as boot config\?[^\r\n]*\(Default:[ ]*1\)} {
+                      puts "\n>>> accepting boot config 1"
+                      sendline ""
+                  }
+
+                  -re {(?i)Would you like to copy data to the new image\?[^\r\n]*\[Y/n\]} {
+                      puts "\n>>> no previous install data to copy"
+                      sendline "n"
+                  }
+
+                  -re {(?i)(continue|proceed)[^\r\n]*\[y/N\]} {
+                      sendline "y"
+                  }
+
+                  -re {(?i)The image installed successfully; please reboot now\.} {
+                      puts "\n>>> installer reported success"
+                      set done 1
+                  }
+
+                  -re {(?i)(installation completed successfully|installation complete|installed successfully)} {
+                      set done 1
+                  }
+                  -re {vyos@vyos[^\r\n]*[$#]} {
+                      set done 1
+                  }
+                  timeout {
+                      fail "installer timed out or hit an unhandled prompt"
+                  }
+                  eof {
+                      fail "QEMU exited before installation completed"
+                  }
+              }
+          }
+
+          sendline ""
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]} {}
+              timeout { fail "shell not available after install" }
+              eof { fail "QEMU exited after install" }
+          }
+
+          sendline "sync"
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]} {}
+              timeout { fail "sync did not return" }
+              eof { exit 0 }
+          }
+
+          sendline "sudo poweroff"
+          set timeout 180
+          expect {
+              eof { exit 0 }
+              timeout {
+                  send -- "\001x"
+                  expect eof
+                  exit 0
+              }
+          }
+          EXPECT
+          chmod +x install143.exp
+
+      - name: Install VyOS 1.4.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+          : > install143-transcript.log
+          timeout 1500 ./install143.exp
+          qemu-img info "${DISK}"
+          qemu-img check "${DISK}"
+          allocated="$(du -B1 "${DISK}" | awk '{print $1}')"
+          echo "Allocated bytes: ${allocated}"
+          if [ "${allocated}" -lt 100000000 ]; then
+            echo "ERROR: qcow2 still looks empty"
+            exit 1
+          fi
+
+      - name: Create verification expect script
+        shell: bash
+        run: |
+          cat > verify143.exp <<'EXPECT'
+          #!/usr/bin/expect -f
+          set timeout 900
+          log_user 1
+          log_file -a verify143-transcript.log
+          set disk $env(DISK)
+
+          proc fail {msg} {
+              puts stderr "\nERROR: $msg"
+              exit 1
+          }
+
+          proc sendline {s} {
+              send -- "$s\r"
+          }
+
+          spawn qemu-system-x86_64               -machine accel=tcg               -cpu max               -m 2048               -smp 2               -drive file=$disk,if=virtio,format=qcow2               -boot order=c               -nographic               -no-reboot
+
+          expect {
+              -re {(?i)vyos login:} {
+                  after 300
+                  sendline "vyos"
+
+                  # Same ttyS0 behavior as the live ISO: send the password
+                  # directly instead of relying on a Password: matcher.
+                  after 1000
+                  puts "\n>>> sending installed-system password"
+                  sendline "vyos"
+              }
+              timeout { fail "installed login prompt not reached" }
+              eof { fail "installed VM exited before login" }
+          }
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]} {}
+              -re {(?i)login incorrect} { fail "installed credentials rejected" }
+              -re {(?i)login timed out} { fail "installed login timed out after password was sent" }
+              timeout { fail "installed shell not reached" }
+              eof { fail "installed VM exited before shell" }
+          }
+
+          sendline "show version"
+          set saw_version 0
+
+          expect {
+              -re {VyOS[^\r\n]*1\.4\.3} {
+                  set saw_version 1
+                  exp_continue
+              }
+              -re {vyos@vyos[^\r\n]*[$#]} {
+                  if {!$saw_version} {
+                      fail "show version did not report 1.4.3"
+                  }
+              }
+              timeout { fail "show version timed out" }
+              eof { fail "VM exited during version verification" }
+          }
+
+          puts "\n>>> VERIFIED: installed VyOS is 1.4.3"
+          sendline "sync"
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]} {
+                  sendline "sudo poweroff"
+              }
+              timeout {
+                  send -- "\001x"
+                  exit 0
+              }
+              eof { exit 0 }
+          }
+
+          set timeout 180
+          expect {
+              eof { exit 0 }
+              timeout {
+                  send -- "\001x"
+                  expect eof
+                  exit 0
+              }
+          }
+          EXPECT
+          chmod +x verify143.exp
+
+      - name: Boot installed disk and verify 1.4.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+          : > verify143-transcript.log
+          timeout 1500 ./verify143.exp
+          qemu-img check "${DISK}"
+          qemu-img info "${DISK}"
+          echo "VyOS 1.4.3 install E2E PASS"
+
+      - name: Diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          qemu-img info "${DISK}" || true
+          qemu-img check "${DISK}" || true
+          ls -lh "${DISK}" || true
+          du -h "${DISK}" || true
+          echo "===== installer transcript ====="
+          tail -n 400 install143-transcript.log 2>/dev/null || true
+          echo "===== verify transcript ====="
+          tail -n 400 verify143-transcript.log 2>/dev/null || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyos-143-install-e2e-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            install143-transcript.log
+            verify143-transcript.log
+            install143.exp
+            verify143.exp
+            iso-sha256.txt
+
+      - name: Upload installed disk
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyos-1.4.3-installed-qcow2
+          retention-days: 3
+          compression-level: 1
+          path: vyos-143-e2e.qcow2
+  upgrade-and-verify:
+    name: Upgrade VyOS 1.4.3 to 1.5.1
+    needs: install-and-verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            expect \
+            curl \
+            file \
+            e2fsprogs
+
+      # The qcow2 does NOT need to be published to a GitHub Release.
+      # It is passed directly from the install job as an Actions artifact.
+      - name: Download installed VyOS 1.4.3 qcow2 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vyos-1.4.3-installed-qcow2
+          path: .
+
+      - name: Check downloaded seed disk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -s "${DISK}"
+          ls -lh "${DISK}"
+          qemu-img info "${DISK}"
+          qemu-img check "${DISK}"
+
+      - name: Download VyOS 1.5.1 ISO
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${ISO_151}"
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 2 \
+            --output "${ISO_151}" \
+            "${url}"
+
+          test -s "${ISO_151}"
+          file "${ISO_151}"
+          ls -lh "${ISO_151}"
+
+          sha256sum "${ISO_151}" | tee iso-151-sha256.txt
+
+          actual="$(sha256sum "${ISO_151}" | awk '{print $1}')"
+          expected="548482ed6a12c2b804e4a6dda95b5a0a2b830604b59736631fd90256edb86ec8"
+
+          if [ "${actual}" != "${expected}" ]; then
+            echo "ERROR: VyOS 1.5.1 ISO SHA256 mismatch"
+            echo "expected: ${expected}"
+            echo "actual:   ${actual}"
+            exit 1
+          fi
+
+      # Avoid guest networking entirely.
+      #
+      # Put the 1.5.1 ISO inside a small ext4 filesystem and attach it to
+      # the VM as /dev/vdb. VyOS then sees a normal local ISO path:
+      #
+      #   /mnt/upgrade/vyos-1.5.1-generic-amd64.iso
+      #
+      # This exercises the native:
+      #
+      #   add system image <local-path>
+      #
+      - name: Build local upgrade media
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -f "${UPGRADE_MEDIA}"
+          truncate -s 1G "${UPGRADE_MEDIA}"
+          mkfs.ext4 -F -L VYOS_UPGRADE "${UPGRADE_MEDIA}"
+
+          mkdir -p host-upgrade-mnt
+          sudo mount -o loop "${UPGRADE_MEDIA}" host-upgrade-mnt
+          sudo cp "${ISO_151}" "host-upgrade-mnt/${ISO_151}"
+          sync
+          sudo umount host-upgrade-mnt
+
+          file "${UPGRADE_MEDIA}"
+          ls -lh "${UPGRADE_MEDIA}"
+
+      - name: Create native add-system-image upgrade driver
+        shell: bash
+        run: |
+          cat > upgrade151.exp <<'EXPECT'
+          #!/usr/bin/expect -f
+
+          set timeout 1200
+          log_user 1
+          log_file -a upgrade151-transcript.log
+
+          set disk  $env(DISK)
+          set media $env(UPGRADE_MEDIA)
+          set iso   $env(ISO_151)
+
+          proc fail {msg} {
+              puts stderr "\n======================================================"
+              puts stderr "ERROR: $msg"
+              puts stderr "======================================================"
+              exit 1
+          }
+
+          proc sendline {s} {
+              send -- "$s\r"
+          }
+
+          proc wait_shell {} {
+              expect {
+                  -re {vyos@vyos[^\r\n]*[$#]} {
+                      return
+                  }
+                  timeout {
+                      fail "VyOS shell prompt not reached"
+                  }
+                  eof {
+                      fail "QEMU exited while waiting for VyOS shell"
+                  }
+              }
+          }
+
+          puts "\n======================================================"
+          puts " Booting installed VyOS 1.4.3 for native upgrade"
+          puts "======================================================"
+
+          spawn qemu-system-x86_64 \
+              -machine accel=tcg \
+              -cpu max \
+              -m 2048 \
+              -smp 2 \
+              -drive file=$disk,if=virtio,format=qcow2 \
+              -drive file=$media,if=virtio,format=raw,readonly=on \
+              -boot order=c \
+              -nographic \
+              -no-reboot
+
+          # ttyS0 Password: matching was unreliable in the validated 1.4.3
+          # install workflow. Send the password directly after username.
+          expect {
+              -re {(?i)vyos login:} {
+                  puts "\n>>> 1.4.3 login prompt reached"
+                  after 300
+                  sendline "vyos"
+                  after 1000
+                  puts "\n>>> sending 1.4.3 password"
+                  sendline "vyos"
+              }
+              timeout { fail "1.4.3 login prompt not reached" }
+              eof     { fail "QEMU exited before 1.4.3 login" }
+          }
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]} {
+                  puts "\n>>> 1.4.3 shell reached"
+              }
+              -re {(?i)login incorrect} {
+                  fail "1.4.3 credentials rejected"
+              }
+              -re {(?i)login timed out} {
+                  fail "1.4.3 login timed out"
+              }
+              timeout {
+                  fail "1.4.3 shell not reached"
+              }
+              eof {
+                  fail "QEMU exited before 1.4.3 shell"
+              }
+          }
+
+          # Prove the starting version before changing anything.
+          sendline "show version"
+
+          set saw_143 0
+          expect {
+              -re {Version:[ ]*VyOS[ ]*1\.4\.3} {
+                  set saw_143 1
+                  exp_continue
+              }
+              -re {vyos@vyos[^\r\n]*[$#]} {
+                  if {!$saw_143} {
+                      fail "upgrade VM did not start from VyOS 1.4.3"
+                  }
+              }
+              timeout {
+                  fail "show version on 1.4.3 timed out"
+              }
+              eof {
+                  fail "QEMU exited during 1.4.3 version check"
+              }
+          }
+
+          puts "\n>>> confirmed starting version VyOS 1.4.3"
+
+          # Mount host-created ext4 upgrade media.
+          sendline "sudo mkdir -p /mnt/upgrade && sudo mount -o ro /dev/vdb /mnt/upgrade && test -s /mnt/upgrade/$iso && echo __UPGRADE_MEDIA_READY__"
+
+          expect {
+              -re {__UPGRADE_MEDIA_READY__} {
+                  puts "\n>>> local 1.5.1 ISO is visible inside VyOS"
+              }
+              timeout {
+                  fail "unable to mount/read /dev/vdb upgrade media"
+              }
+              eof {
+                  fail "QEMU exited while mounting upgrade media"
+              }
+          }
+
+          wait_shell
+
+          puts "\n======================================================"
+          puts " Running native: add system image"
+          puts "======================================================"
+
+          sendline "add system image /mnt/upgrade/$iso"
+
+          set upgrade_done 0
+
+          while {!$upgrade_done} {
+              expect {
+                  -re {(?i)Do you want to continue without signature check\?[^\r\n]*(yes/no|y/n)} {
+                      puts "\n>>> allowing local ISO without detached signature"
+                      sendline "yes"
+                  }
+
+                  -re {(?i)What would you like to name this image\?} {
+                      puts "\n>>> accepting image name 1.5.1"
+                      sendline ""
+                  }
+
+                  -re {(?i)Would you like to set the new image as the default one for boot\?[^\r\n]*\[Y/n\]} {
+                      puts "\n>>> setting 1.5.1 as default boot"
+                      sendline "Y"
+                  }
+
+                  -re {(?i)An active configuration was found\.[^\r\n]*Would you like to copy it to the new image\?[^\r\n]*\[Y/n\]} {
+                      puts "\n>>> copying active configuration"
+                      sendline "Y"
+                  }
+
+                  -re {(?i)Would you like to copy SSH host keys\?[^\r\n]*\[Y/n\]} {
+                      puts "\n>>> copying SSH host keys"
+                      sendline "Y"
+                  }
+
+                  # Older 1.4.x installer wording.
+                  -re {(?i)Would you like to save the current configuration[^\r\n]*} {
+                      puts "\n>>> saving current configuration into 1.5.1"
+                      sendline "Yes"
+                  }
+
+                  -re {(?i)directory and config file\?[^\r\n]*\(Yes/No\)[^\r\n]*\[Yes\]} {
+                      puts "\n>>> saving configuration directory/config file"
+                      sendline "Yes"
+                  }
+
+                  -re {(?i)Would you like to save the SSH host keys[^\r\n]*} {
+                      puts "\n>>> saving SSH host keys"
+                      sendline "Yes"
+                  }
+
+                  -re {(?i)Setting up grub configuration} {
+                      puts "\n>>> grub configuration is being updated"
+                      exp_continue
+                  }
+
+                  -re {(?i)Done\.} {
+                      # Do not immediately assume every "Done." is final.
+                      # Wait for the operational prompt below.
+                      exp_continue
+                  }
+
+                  -re {vyos@vyos[^\r\n]*[$#]} {
+                      puts "\n>>> add system image returned to shell"
+                      set upgrade_done 1
+                  }
+
+                  timeout {
+                      fail "add system image timed out or hit an unhandled prompt"
+                  }
+
+                  eof {
+                      fail "QEMU exited during add system image"
+                  }
+              }
+          }
+
+          # Show image inventory for the transcript.
+          sendline "show system image"
+
+          set saw_151_image 0
+          expect {
+              -re {1\.5\.1} {
+                  set saw_151_image 1
+                  exp_continue
+              }
+              -re {vyos@vyos[^\r\n]*[$#]} {
+                  if {!$saw_151_image} {
+                      fail "1.5.1 is not present in show system image"
+                  }
+              }
+              timeout {
+                  fail "show system image timed out"
+              }
+              eof {
+                  fail "QEMU exited during image inventory check"
+              }
+          }
+
+          puts "\n>>> 1.5.1 image is installed"
+
+          # Make default boot explicit even if the installer already did it.
+          sendline "set system image default-boot 1.5.1"
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]} {
+                  puts "\n>>> 1.5.1 explicitly selected as default boot"
+              }
+              timeout {
+                  fail "unable to set 1.5.1 as default boot"
+              }
+              eof {
+                  fail "QEMU exited while setting default image"
+              }
+          }
+
+          sendline "sync"
+          wait_shell
+
+          puts "\n>>> powering off upgraded disk"
+          sendline "sudo poweroff"
+
+          set timeout 240
+          expect {
+              eof {
+                  puts "\n>>> upgrade VM powered off"
+                  exit 0
+              }
+              timeout {
+                  # QEMU nographic escape: Ctrl-A x
+                  send -- "\001x"
+                  expect eof
+                  exit 0
+              }
+          }
+          EXPECT
+
+          chmod +x upgrade151.exp
+
+      - name: Upgrade 1.4.3 disk to 1.5.1
+        shell: bash
+        run: |
+          set -euxo pipefail
+          : > upgrade151-transcript.log
+
+          timeout 1800 ./upgrade151.exp
+
+          qemu-img check "${DISK}"
+          qemu-img info "${DISK}"
+          ls -lh "${DISK}"
+
+      - name: Create VyOS 1.5.1 boot verification driver
+        shell: bash
+        run: |
+          cat > verify151.exp <<'EXPECT'
+          #!/usr/bin/expect -f
+
+          set timeout 1200
+          log_user 1
+          log_file -a verify151-transcript.log
+
+          set disk $env(DISK)
+
+          proc fail {msg} {
+              puts stderr "\n======================================================"
+              puts stderr "ERROR: $msg"
+              puts stderr "======================================================"
+              exit 1
+          }
+
+          proc sendline {s} {
+              send -- "$s\r"
+          }
+
+          puts "\n======================================================"
+          puts " Booting upgraded disk and verifying VyOS 1.5.1"
+          puts "======================================================"
+
+          spawn qemu-system-x86_64 \
+              -machine accel=tcg \
+              -cpu max \
+              -m 2048 \
+              -smp 2 \
+              -drive file=$disk,if=virtio,format=qcow2 \
+              -boot order=c \
+              -nographic \
+              -no-reboot
+
+          expect {
+              -re {(?i)vyos login:} {
+                  puts "\n>>> upgraded-system login prompt reached"
+                  after 300
+                  sendline "vyos"
+                  after 1000
+                  puts "\n>>> sending upgraded-system password"
+                  sendline "vyos"
+              }
+              timeout {
+                  fail "VyOS 1.5.1 login prompt not reached"
+              }
+              eof {
+                  fail "QEMU exited before VyOS 1.5.1 login"
+              }
+          }
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]} {
+                  puts "\n>>> upgraded VyOS shell reached"
+              }
+              -re {(?i)login incorrect} {
+                  fail "upgraded system rejected vyos/vyos"
+              }
+              -re {(?i)login timed out} {
+                  fail "upgraded system login timed out"
+              }
+              timeout {
+                  fail "upgraded VyOS shell not reached"
+              }
+              eof {
+                  fail "QEMU exited before upgraded shell"
+              }
+          }
+
+          sendline "show version"
+
+          set saw_151 0
+          set saw_installed 0
+
+          expect {
+              -re {Version:[ ]*VyOS[ ]*1\.5\.1} {
+                  set saw_151 1
+                  exp_continue
+              }
+
+              -re {Boot via:[ ]*installed image} {
+                  set saw_installed 1
+                  exp_continue
+              }
+
+              -re {vyos@vyos[^\r\n]*[$#]} {
+                  if {!$saw_151} {
+                      fail "upgraded system did not boot VyOS 1.5.1"
+                  }
+                  if {!$saw_installed} {
+                      fail "VyOS 1.5.1 did not boot as an installed image"
+                  }
+              }
+
+              timeout {
+                  fail "VyOS 1.5.1 show version timed out"
+              }
+
+              eof {
+                  fail "QEMU exited during VyOS 1.5.1 version verification"
+              }
+          }
+
+          puts "\n======================================================"
+          puts " VERIFIED: VyOS 1.4.3 -> 1.5.1 native upgrade PASS"
+          puts "======================================================"
+
+          sendline "show system image"
+
+          expect {
+              -re {1\.5\.1} {
+                  exp_continue
+              }
+              -re {vyos@vyos[^\r\n]*[$#]} {}
+              timeout {
+                  fail "final show system image timed out"
+              }
+              eof {
+                  fail "QEMU exited during final image inventory"
+              }
+          }
+
+          sendline "sync"
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]} {
+                  sendline "sudo poweroff"
+              }
+              timeout {
+                  send -- "\001x"
+                  exit 0
+              }
+              eof {
+                  exit 0
+              }
+          }
+
+          set timeout 240
+
+          expect {
+              eof {
+                  exit 0
+              }
+              timeout {
+                  send -- "\001x"
+                  expect eof
+                  exit 0
+              }
+          }
+          EXPECT
+
+          chmod +x verify151.exp
+
+      - name: Boot upgraded disk and verify VyOS 1.5.1
+        shell: bash
+        run: |
+          set -euxo pipefail
+          : > verify151-transcript.log
+
+          timeout 1800 ./verify151.exp
+
+          qemu-img check "${DISK}"
+          qemu-img info "${DISK}"
+
+          echo
+          echo "======================================================"
+          echo " VyOS 1.4.3 -> 1.5.1 NATIVE UPGRADE E2E PASS"
+          echo "======================================================"
+
+      - name: Upgrade diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          echo "======================================================"
+          echo " upgraded qcow2"
+          echo "======================================================"
+          qemu-img info "${DISK}" || true
+          qemu-img check "${DISK}" || true
+          ls -lh "${DISK}" || true
+          du -h "${DISK}" || true
+
+          echo
+          echo "======================================================"
+          echo " add system image transcript"
+          echo "======================================================"
+          tail -n 600 upgrade151-transcript.log 2>/dev/null || true
+
+          echo
+          echo "======================================================"
+          echo " 1.5.1 boot verification transcript"
+          echo "======================================================"
+          tail -n 600 verify151-transcript.log 2>/dev/null || true
+
+      - name: Upload upgrade diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyos-143-to-151-upgrade-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            upgrade151-transcript.log
+            verify151-transcript.log
+            upgrade151.exp
+            verify151.exp
+            iso-151-sha256.txt
+
+      - name: Upload upgraded VyOS 1.5.1 qcow2
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyos-1.5.1-upgraded-qcow2
+          retention-days: 7
+          compression-level: 1
+          path: vyos-143-e2e.qcow2

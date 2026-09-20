@@ -71,19 +71,17 @@ jobs:
                   puts "\n>>> live login prompt"
                   after 300
                   sendline "vyos"
+
+                  # Do not depend on matching the serial Password: prompt.
+                  # We have observed ttyS0 display it while Expect fails to
+                  # recognize the prompt. login(1) is already waiting for
+                  # the password here, so send it directly after a short delay.
+                  after 1000
+                  puts "\n>>> sending live password"
+                  sendline "vyos"
               }
               timeout { fail "live login prompt not reached" }
               eof { fail "QEMU exited before live login" }
-          }
-
-          expect {
-              -re {(?i)password:} {
-                  puts "\n>>> sending live password"
-                  after 300
-                  sendline "vyos"
-              }
-              timeout { fail "live password prompt not reached" }
-              eof { fail "QEMU exited during live login" }
           }
 
           expect {
@@ -91,7 +89,7 @@ jobs:
                   puts "\n>>> live shell reached"
               }
               -re {(?i)login incorrect} { fail "live credentials rejected" }
-              -re {(?i)login timed out} { fail "live login timed out after password prompt" }
+              -re {(?i)login timed out} { fail "live login timed out after password was sent" }
               timeout { fail "live shell not reached" }
               eof { fail "QEMU exited before live shell" }
           }
@@ -210,24 +208,21 @@ jobs:
               -re {(?i)vyos login:} {
                   after 300
                   sendline "vyos"
+
+                  # Same ttyS0 behavior as the live ISO: send the password
+                  # directly instead of relying on a Password: matcher.
+                  after 1000
+                  puts "\n>>> sending installed-system password"
+                  sendline "vyos"
               }
               timeout { fail "installed login prompt not reached" }
               eof { fail "installed VM exited before login" }
           }
 
           expect {
-              -re {(?i)password:} {
-                  after 300
-                  sendline "vyos"
-              }
-              timeout { fail "installed password prompt not reached" }
-              eof { fail "installed VM exited during login" }
-          }
-
-          expect {
               -re {vyos@vyos[^\r\n]*[$#]} {}
               -re {(?i)login incorrect} { fail "installed credentials rejected" }
-              -re {(?i)login timed out} { fail "installed login timed out" }
+              -re {(?i)login timed out} { fail "installed login timed out after password was sent" }
               timeout { fail "installed shell not reached" }
               eof { fail "installed VM exited before shell" }
           }

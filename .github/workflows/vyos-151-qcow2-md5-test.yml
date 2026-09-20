@@ -1,0 +1,217 @@
+name: VyOS 1.5.1 QCOW2 MD5 Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: vyos-test-images
+  ISO_151: vyos-1.5.1-generic-amd64.iso
+  DISK: vyos-1.5.1-kvm-amd64.qcow2
+  EXPECTED_MD5: 816ec7c3699a9e4f19e2b8765fd3d7eb
+
+jobs:
+  build-and-compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils expect curl file
+
+      - name: Download VyOS 1.5.1 ISO
+        run: |
+          set -euxo pipefail
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${ISO_151}"
+          curl -fL --retry 5 --retry-delay 2 -o "${ISO_151}" "${url}"
+          test -s "${ISO_151}"
+          sha256sum "${ISO_151}" | tee iso-sha256.txt
+          ls -lh "${ISO_151}"
+
+      - name: Create blank QCOW2
+        run: |
+          set -euxo pipefail
+          rm -f "${DISK}"
+          qemu-img create -f qcow2 "${DISK}" 8G
+          qemu-img info "${DISK}"
+
+      - name: Create installer driver
+        run: |
+          cat > install151.exp <<'EXPECT'
+          #!/usr/bin/expect -f
+          set timeout 1200
+          log_user 1
+          log_file -a install151-transcript.log
+
+          set iso  $env(ISO_151)
+          set disk $env(DISK)
+
+          proc fail {msg} {
+              puts stderr "\nERROR: $msg"
+              exit 1
+          }
+
+          proc sendline {s} {
+              send -- "$s\r"
+          }
+
+          spawn qemu-system-x86_64 \
+              -machine accel=tcg \
+              -cpu max \
+              -m 2048 \
+              -smp 2 \
+              -drive file=$disk,if=virtio,format=qcow2 \
+              -cdrom $iso \
+              -boot order=d \
+              -nographic \
+              -no-reboot
+
+          expect {
+              -re {(?i)vyos login:} {
+                  after 300
+                  sendline "vyos"
+                  after 1000
+                  sendline "vyos"
+              }
+              timeout { fail "live login prompt not reached" }
+              eof { fail "QEMU exited before live login" }
+          }
+
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]} {}
+              -re {(?i)login incorrect} { fail "live login rejected" }
+              -re {(?i)login timed out} { fail "live login timed out" }
+              timeout { fail "live shell not reached" }
+              eof { fail "QEMU exited before live shell" }
+          }
+
+          sendline "install image"
+
+          set done 0
+          while {!$done} {
+              expect {
+                  -re {Would you like to continue\?[^\r\n]*\[y/N\]} {
+                      sendline "y"
+                  }
+                  -re {What would you like to name this image\?} {
+                      sendline ""
+                  }
+                  -re {Please enter a password for the "vyos" user:} {
+                      sendline "vyos"
+                  }
+                  -re {Please confirm password for the "vyos" user:} {
+                      sendline "vyos"
+                  }
+                  -re {What console should be used by default\?} {
+                      sendline ""
+                  }
+                  -re {Which one should be used for installation\?} {
+                      sendline ""
+                  }
+                  -re {Installation will delete all data on the drive\. Continue\?[^\r\n]*\[y/N\]} {
+                      sendline "y"
+                  }
+                  -re {Would you like to use all the free space on the drive\?[^\r\n]*\[Y/n\]} {
+                      sendline ""
+                  }
+                  -re {Which file would you like as boot config\?} {
+                      sendline ""
+                  }
+                  -re {(?i)The image installed successfully; please reboot now\.} {
+                      set done 1
+                  }
+                  -re {(?i)(installation completed successfully|installation complete|installed successfully)} {
+                      set done 1
+                  }
+                  -re {vyos@vyos[^\r\n]*[$#]} {
+                      set done 1
+                  }
+                  timeout { fail "installer timed out or hit an unhandled prompt" }
+                  eof { fail "QEMU exited before install completed" }
+              }
+          }
+
+          sendline ""
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]} {}
+              timeout { fail "shell not available after install" }
+              eof { fail "QEMU exited after install" }
+          }
+
+          sendline "sync"
+          expect {
+              -re {vyos@vyos[^\r\n]*[$#]} {}
+              timeout { fail "sync did not return" }
+              eof { exit 0 }
+          }
+
+          sendline "sudo poweroff"
+          set timeout 240
+          expect {
+              eof { exit 0 }
+              timeout {
+                  send -- "\001x"
+                  expect eof
+                  exit 0
+              }
+          }
+          EXPECT
+
+          chmod +x install151.exp
+
+      - name: Install VyOS 1.5.1
+        run: |
+          set -euxo pipefail
+          : > install151-transcript.log
+          timeout 2100 ./install151.exp
+          qemu-img check "${DISK}"
+          qemu-img info "${DISK}"
+
+      - name: Compare MD5
+        id: compare
+        run: |
+          set -euxo pipefail
+          actual="$(md5sum "${DISK}" | awk '{print $1}')"
+          size="$(stat -c '%s' "${DISK}")"
+
+          {
+            echo "Expected GNS3 MD5: ${EXPECTED_MD5}"
+            echo "Generated MD5:     ${actual}"
+            echo "Generated size:    ${size}"
+          } | tee md5-comparison.txt
+
+          echo "actual=${actual}" >> "${GITHUB_OUTPUT}"
+
+          if [ "${actual}" = "${EXPECTED_MD5}" ]; then
+            echo "match=true" >> "${GITHUB_OUTPUT}"
+            echo "MD5 MATCH"
+          else
+            echo "match=false" >> "${GITHUB_OUTPUT}"
+            echo "MD5 MISMATCH"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyos-151-qcow2-md5-test
+          retention-days: 7
+          compression-level: 1
+          path: |
+            vyos-1.5.1-kvm-amd64.qcow2
+            md5-comparison.txt
+            iso-sha256.txt
+            install151-transcript.log
+            install151.exp
+
+      - name: Enforce MD5 match
+        if: steps.compare.outputs.match != 'true'
+        run: |
+          echo "Expected: ${EXPECTED_MD5}"
+          echo "Actual:   ${{ steps.compare.outputs.actual }}"
+          exit 1

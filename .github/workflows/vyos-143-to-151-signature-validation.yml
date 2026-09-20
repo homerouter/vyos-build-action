@@ -585,7 +585,12 @@ jobs:
           # Do not print success unless address, default route and DNS
           # resolution all work.
           #
-          sendline "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do ip -4 addr show dev eth0 | grep -q 'inet ' && ip route | grep -q '^default ' && getent ahostsv4 github.com >/dev/null 2>&1 && break; sleep 2; done; ip -4 addr show dev eth0; ip route; cat /etc/resolv.conf; getent ahostsv4 github.com >/dev/null 2>&1 && echo __DNS_OK__ || echo __DNS_FAIL__"
+          # IMPORTANT:
+          # Do not put the literal Expect success/failure tokens in the
+          # command text. The interactive tty echoes the command itself,
+          # and Expect would otherwise match the echoed command before it
+          # has actually executed.
+          sendline "net_ok=0; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do if ip -4 addr show dev eth0 | grep -q 'inet ' && ip route | grep -q '^default ' && getent ahostsv4 github.com >/dev/null 2>&1; then net_ok=1; break; fi; sleep 2; done; ip -4 addr show dev eth0; ip route; cat /etc/resolv.conf; if [ \"$net_ok\" = 1 ]; then printf '__DNS_%s__\\n' OK; else printf '__DNS_%s__\\n' FAIL; fi"
 
           expect {
               -re {__DNS_OK__} {
@@ -611,7 +616,9 @@ jobs:
           # Prove outbound HTTPS from the guest before invoking
           # add system image.
           #
-          sendline "curl -4 -fsSIL --connect-timeout 20 --max-time 60 https://github.com/ >/tmp/github-head.txt 2>/tmp/github-head.err && echo __HTTPS_OK__ || { cat /tmp/github-head.err; echo __HTTPS_FAIL__; }"
+          # Same anti-echo rule here: construct the marker at runtime so
+          # the full marker never appears in the echoed input command.
+          sendline "if curl -4 -fsSIL --connect-timeout 20 --max-time 60 https://github.com/ >/tmp/github-head.txt 2>/tmp/github-head.err; then printf '__HTTPS_%s__\\n' OK; else cat /tmp/github-head.err; printf '__HTTPS_%s__\\n' FAIL; fi"
 
           expect {
               -re {__HTTPS_OK__} {

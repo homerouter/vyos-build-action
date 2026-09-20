@@ -534,7 +534,6 @@ jobs:
 
           #
           # Bring eth0 up with DHCP using VyOS configuration mode.
-          # QEMU user networking provides DHCP, DNS and outbound NAT.
           #
           sendline "configure"
 
@@ -548,7 +547,7 @@ jobs:
           expect {
               -re {vyos@vyos[^\r\n]*#} {}
               timeout { fail "unable to configure eth0 DHCP" }
-              eof     { fail "QEMU exited configuring eth0" }
+              eof     { fail "QEMU exited configuring eth0 DHCP" }
           }
 
           sendline "set system name-server 1.1.1.1"
@@ -568,43 +567,43 @@ jobs:
           sendline "commit"
           expect {
               -re {vyos@vyos[^\r\n]*#} {}
-              timeout { fail "DHCP commit timed out" }
-              eof     { fail "QEMU exited during DHCP commit" }
+              timeout { fail "network/DNS commit timed out" }
+              eof     { fail "QEMU exited during network/DNS commit" }
+          }
+
+          sendline "save"
+          expect {
+              -re {vyos@vyos[^\r\n]*#} {
+                  puts "\n>>> network configuration saved"
+              }
+              timeout { fail "network configuration save timed out" }
+              eof     { fail "QEMU exited during configuration save" }
           }
 
           sendline "exit"
           expect {
-              -re {vyos@vyos[^\r\n]*[$]} {}
+              -re {vyos@vyos[^\r\n]*[$]} {
+                  puts "\n>>> back in operational shell"
+              }
               timeout { fail "unable to leave configuration mode" }
               eof     { fail "QEMU exited leaving configuration mode" }
           }
 
           #
-          # Strict network gate.
+          # Strict network gate, from the operational shell.
           #
-          # Do not print success unless address, default route and DNS
-          # resolution all work.
+          # Avoid literal success/failure marker strings in the sent command
+          # so Expect cannot match the tty echo before the command executes.
           #
-          # IMPORTANT:
-          # Do not put the literal Expect success/failure tokens in the
-          # command text. The interactive tty echoes the command itself,
-          # and Expect would otherwise match the echoed command before it
-          # has actually executed.
-          sendline "net_ok=0; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do if ip -4 addr show dev eth0 | grep -q 'inet ' && ip route | grep -q '^default ' && getent ahostsv4 github.com >/dev/null 2>&1; then net_ok=1; break; fi; sleep 2; done; ip -4 addr show dev eth0; ip route; cat /etc/resolv.conf; if [ \"$net_ok\" = 1 ]; then printf '__DNS_%s__\\n' OK; else printf '__DNS_%s__\\n' FAIL; fi"
+          sendline "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do if ip -4 addr show dev eth0 | grep -q 'inet ' && ip route | grep -q '^default ' && getent ahostsv4 github.com >/dev/null 2>&1; then printf '__DNS_%s__\\n' OK; break; fi; sleep 2; done"
 
           expect {
               -re {__DNS_OK__} {
                   puts "\n>>> DHCP/default route/DNS ready"
               }
-
-              -re {__DNS_FAIL__} {
-                  fail "guest DNS resolution failed"
-              }
-
               timeout {
-                  fail "guest DHCP/default route/DNS readiness timed out"
+                  fail "guest address/default route/DNS did not become ready"
               }
-
               eof {
                   fail "QEMU exited during network readiness check"
               }
@@ -613,26 +612,20 @@ jobs:
           wait_shell
 
           #
-          # Prove outbound HTTPS from the guest before invoking
-          # add system image.
+          # Verify real outbound HTTPS from the operational shell.
           #
-          # Same anti-echo rule here: construct the marker at runtime so
-          # the full marker never appears in the echoed input command.
           sendline "if curl -4 -fsSIL --connect-timeout 20 --max-time 60 https://github.com/ >/tmp/github-head.txt 2>/tmp/github-head.err; then printf '__HTTPS_%s__\\n' OK; else cat /tmp/github-head.err; printf '__HTTPS_%s__\\n' FAIL; fi"
 
           expect {
               -re {__HTTPS_OK__} {
                   puts "\n>>> guest HTTPS to github.com works"
               }
-
               -re {__HTTPS_FAIL__} {
                   fail "guest HTTPS to github.com failed"
               }
-
               timeout {
                   fail "guest HTTPS preflight timed out"
               }
-
               eof {
                   fail "QEMU exited during HTTPS preflight"
               }
@@ -641,7 +634,7 @@ jobs:
           wait_shell
 
           puts "\n======================================================"
-          puts " Running native URL command:"
+          puts " Running from VyOS operational shell:"
           puts " add system image $url"
           puts "======================================================"
 

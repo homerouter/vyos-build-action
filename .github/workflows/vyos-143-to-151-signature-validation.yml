@@ -551,6 +551,20 @@ jobs:
               eof     { fail "QEMU exited configuring eth0" }
           }
 
+          sendline "set system name-server 1.1.1.1"
+          expect {
+              -re {vyos@vyos[^\r\n]*#} {}
+              timeout { fail "unable to configure primary DNS" }
+              eof     { fail "QEMU exited configuring primary DNS" }
+          }
+
+          sendline "set system name-server 8.8.8.8"
+          expect {
+              -re {vyos@vyos[^\r\n]*#} {}
+              timeout { fail "unable to configure secondary DNS" }
+              eof     { fail "QEMU exited configuring secondary DNS" }
+          }
+
           sendline "commit"
           expect {
               -re {vyos@vyos[^\r\n]*#} {}
@@ -566,21 +580,54 @@ jobs:
           }
 
           #
-          # Wait for DHCP/default route/DNS to settle.
+          # Strict network gate.
           #
-          sendline "for i in 1 2 3 4 5 6 7 8 9 10; do ip -4 addr show dev eth0 | grep -q 'inet ' && ip route | grep -q '^default ' && break; sleep 2; done; ip -4 addr show dev eth0; ip route; getent hosts github.com; echo __NETWORK_READY__"
+          # Do not print success unless address, default route and DNS
+          # resolution all work.
+          #
+          sendline "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do ip -4 addr show dev eth0 | grep -q 'inet ' && ip route | grep -q '^default ' && getent ahostsv4 github.com >/dev/null 2>&1 && break; sleep 2; done; ip -4 addr show dev eth0; ip route; cat /etc/resolv.conf; getent ahostsv4 github.com >/dev/null 2>&1 && echo __DNS_OK__ || echo __DNS_FAIL__"
 
           expect {
-              -re {__NETWORK_READY__} {
-                  puts "\n>>> guest network configured"
+              -re {__DNS_OK__} {
+                  puts "\n>>> DHCP/default route/DNS ready"
+              }
+
+              -re {__DNS_FAIL__} {
+                  fail "guest DNS resolution failed"
               }
 
               timeout {
-                  fail "guest network did not become ready"
+                  fail "guest DHCP/default route/DNS readiness timed out"
               }
 
               eof {
-                  fail "QEMU exited while configuring network"
+                  fail "QEMU exited during network readiness check"
+              }
+          }
+
+          wait_shell
+
+          #
+          # Prove outbound HTTPS from the guest before invoking
+          # add system image.
+          #
+          sendline "curl -4 -fsSIL --connect-timeout 20 --max-time 60 https://github.com/ >/tmp/github-head.txt 2>/tmp/github-head.err && echo __HTTPS_OK__ || { cat /tmp/github-head.err; echo __HTTPS_FAIL__; }"
+
+          expect {
+              -re {__HTTPS_OK__} {
+                  puts "\n>>> guest HTTPS to github.com works"
+              }
+
+              -re {__HTTPS_FAIL__} {
+                  fail "guest HTTPS to github.com failed"
+              }
+
+              timeout {
+                  fail "guest HTTPS preflight timed out"
+              }
+
+              eof {
+                  fail "QEMU exited during HTTPS preflight"
               }
           }
 

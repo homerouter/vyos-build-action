@@ -123,9 +123,31 @@ jobs:
                   -re {(?i)(all data|destroy|erase|delete|format)[^\r\n]*(y/N|Y/n)} {
                       sendline "y"
                   }
+
+                  -re {(?i)Would you like to use all the free space on the drive\?[^\r\n]*\[Y/n\]} {
+                      puts "\n>>> using all free space on /dev/vda"
+                      sendline "Y"
+                  }
+
+                  -re {(?i)Which file would you like as boot config\?[^\r\n]*\(Default:[ ]*1\)} {
+                      puts "\n>>> accepting boot config 1"
+                      sendline ""
+                  }
+
+                  -re {(?i)Would you like to copy data to the new image\?[^\r\n]*\[Y/n\]} {
+                      puts "\n>>> no previous install data to copy"
+                      sendline "n"
+                  }
+
                   -re {(?i)(continue|proceed)[^\r\n]*\[y/N\]} {
                       sendline "y"
                   }
+
+                  -re {(?i)The image installed successfully; please reboot now\.} {
+                      puts "\n>>> installer reported success"
+                      set done 1
+                  }
+
                   -re {(?i)(installation completed successfully|installation complete|installed successfully)} {
                       set done 1
                   }

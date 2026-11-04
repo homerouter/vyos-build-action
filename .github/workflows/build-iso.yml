@@ -145,7 +145,7 @@ jobs:
           check_version vyos-intel-qat "${{ steps.packages.outputs.qat_version }}"
           check_version vyos-linux-firmware "${{ steps.packages.outputs.firmware_version }}"
           unsquashfs -ll "$squashfs" > squashfs-files.txt
-          grep -Eq '/nft_fullcone\.ko(\.(xz|zst|gz))?$' squashfs-files.txt
+          grep -Eq '/nft_masq\.ko(\.(xz|zst|gz))?$' squashfs-files.txt
 
       - name: Upload ISO
         uses: actions/upload-artifact@v7
